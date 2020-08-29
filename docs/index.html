@@ -1,0 +1,3623 @@
+<meta charset="utf-8" emacsmode="-*- markdown -*-"><link rel="stylesheet" href="./apidoc_modified.css">
+
+**Writing a custom Unhandled Exception Filter for Maya**
+
+(...or for anything, really. But hey, what good is a tutorial these days without
+a click-bait-y title of sorts?)
+
+# Introduction #
+
+Hello (again, if you've read any of my previous tutorials).
+
+Today's tutorial will focus on creating what is known as an Unhandled Exception
+Filter (a.k.a custom crash dump handler), that will allow us to bypass the
+default Maya crash dump handler and capture more detailed information that we
+can then access in a debugger such as WinDbg (or through writing our own parser
+for the dump files, which we'll also go over in this tutorial). We'll also go
+over some scenarios where a simple unhandled exception filter isn't enough to
+intercept some types of crashes, and discuss possible strategies to accomodate
+those situations.
+
+
+# Code repository #
+
+All the source code for this tutorial is available
+[here](https://github.com/sonictk/maya_custom_unhandled_exception_filter).
+
+Perfunctory disclaimer: the code is written in a very tutorial-focused,
+non-production manner. This means that there is very little
+error-checking/handling going on, with brevity and readability favoured over
+other options that might be more performant and/or scalable. The code is
+available as a reference, and should not be taken as an indicator of what good
+robust code shipped to end-users should look like.
+
+
+# Why are we doing this? #
+
+The default Autodesk Maya crash handler is pretty dismal, all things
+considered. It's essentially there to write out a minidump to disk, attempt to
+invoke some code to attempt recovery of the scene (which, in my professional
+experience, just causes more confusion when attempting to actually debug the
+real crash dump). It also generally _crashes_ in the middle of its own crash
+handling, in which case WER takes over (which can be a good thing sometimes,
+since at least you can [easily customize what WER does in the event of a
+crash](https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps).)
+
+I've also never had a case in my professional experience where Autodesk actually
+took advantage of it to identify our issues; in every single case where a dump
+was involved in triaging and identifying a root cause, I was the one providing
+the dump and initial analysis for our representative to forward to the
+engineering teams instead. For this reason, among others, I don't feel too bad
+about ignoring the existing machinery surrounding the capture of crashes.
+
+For obvious reasons, this tutorial will only focus on Windows. Linux and macOS
+have different facilities for handling exceptions and abnormal process
+termination, and the techniques described in this document won't really apply to
+those platforms. However, where I find certain information to be of use even in
+a cross-platform environment, it will appear in the following manner:
+
+!!! tip Crossing the platforms
+    Platform-specific information goes here.
+
+
+# Requirements #
+
+Let's go over what you'll be required to have with you before following along in
+this tutorial.
+
+
+## What you will need ##
+
+- Windows 10 and _a_ version of Autodesk Maya. This tutorial was
+  written against Maya 2020, but theoretically should work with any version of
+  Maya, as you'll see why later on.
+
+- A **C/C++ development environment** set up and ready to go. (If you want to see
+  what my Emacs setup looks like, it's
+  available [here](https://github.com/sonictk/lightweight-emacs).)
+
+- Visual Studio (For the compiler).
+
+!!! warning MSVC Compiler versions
+    You should use the recommended MSVC compiler that Maya was built against.
+    Information on this is available in the SDK documentation and also on
+    Cyrille Fauvel's blog: https://around-the-corner.typepad.com/adn/2019/12/maya-2020-api-update-guide.html
+
+- The Maya Devkit for your particular Maya version. These are (currently)
+  available at:
+  https://www.autodesk.com/developer-network/platform-technologies/maya
+
+- [WinDbg](https://www.microsoft.com/en-us/p/windbg-preview/9pgjgd53tn86?activetab=pivot:overviewtab).
+  I recommend getting WinDbg Preview, but if you detest the Microsoft Store as
+  much as I do and insist on having local, non-DRM binaries, you can use the
+  [legacy version](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-download-tools) as well.
+
+- A good disassembler if you want to follow along in some of the theory sections
+  of this tutorial. I make use of
+  both [IDA](https://www.hex-rays.com/products/ida/support/download_freeware/)
+  or [radare2/Cutter](https://rada.re/n/), but you're welcome to use any
+  disassembler you'd like, as long as it has x86/x64 architecture support. If
+  you don't have knowledge of x64 assembly, don't worry; I have [the tutorial
+  just for that](https://sonictk.github.io/asm_tutorial/). No guru knowledge
+  required here, just a basic working knowledge of assembly will do.
+
+If you're experienced with writing Maya plug-ins, you probably would have these
+already anyway, so as you can see, it's not that difficult.
+
+
+## What you should know ##
+
+- **Proficiency with C/C++**. This tutorial will not focus on basics, and is
+  meant to be more of a quickstart guide for programmers already experienced
+  with C++ to dive into the specifics of developing a custom unhandled
+  exception filter for Maya, or any other application out there. I have provided
+  sample code along with a basic `build.bat` script in the example code
+  accompanying this tutorial, which should be a welcome sight for those of you
+  battle-scarred by overly-convoluted build systems.
+
+- **A good understanding of debugging on Windows**. I expect that you should, by
+  now, be able to use WinDbg to debug your code, and understand the basic
+  operations involved in operating the debugger. You should also have basic
+  comprehension skills when reading x64 assembly and know how to use a
+  disassembler for basic inspection of binaries.
+
+- **Competency with Maya and the OpenMaya SDK**. This tutorial will not focus on
+  getting you up to speed with the specifics of the OpenMaya API and how Maya
+  works in general; there will not be detailed explanations of how Maya plug-ins
+  work, nor how the callback system works either. You are expected to read up on
+  these subjects on your own if you are unfamiliar with the material covered.
+
+Don't worry about knowing Win32 specifics, I'll go over what you need to know
+as we go along. Let's begin!
+
+
+# Exceptions, how do they even work, like #
+
+Before we begin writing any code, however, let's go into detail about what
+exactly we're dealing with here. The subject of the tutorial today is about
+crash handling, so naturally, we're going to have to talk about exceptions, and
+more specifically, how they're implemented on Windows.
+
+!!! note x86 vs x64 exception handling
+    Because most modern environments make use of x64 Windows and it's getting
+    rarer to find anyone still running on x86 Windows, I'll only be going over
+    how exception handling works on x64, which is surprisingly different from
+    x86 (table-based vs frame-based). If you're interested about how SEH was
+    originally implemented, I recommend reading the excellent resource
+    [A Crash Course on the Depths of Win32 Structured Exception Handling](https://bytepointer.com/resources/pietrek_crash_course_depths_of_win32_seh.htm)
+    which goes over the topic in a much better fashion than I can.
+
+
+## Win64: Structured Exception Handling (SEH) ##
+
+Let's talk a little about how exceptions are handled at a high-level first on
+Windows these days. First of all, when your code runs, unexpected behaviour
+happens in one of two ways: either your code triggers a **software exception**,
+or a **hardware exception** gets initiated by the CPU itself. A software
+exception could be something like an application raising an exception when it
+cannot allocate memory, or the OS itself detecting when an invalid parameter is
+passed to a function (or the application itself simply calling
+`RaiseException`). A hardware exception, on the other hand, can be triggered by
+things such as a divide-by-zero operation, or a floating point overflow, or even
+the most common type of exception: an access violation (i.e. reading/writing to
+inaccessible memory).
+
+The Structured Exception Handling (SEH) mechanism has been around in Windows
+forever (since at least Windows '95), and though its form has changed over the
+decades since, fundamentally its purpose remains the same: it acts as an
+abstraction over both hardware _and_ software-triggered exceptions, and allows
+for programmers to have some degree of control over what happens in those
+events, and, if they choose not to, to have the OS take over instead. It also
+provides the standard for tooling around (i.e. debuggers, compilers) and thus
+allows us not to have to worry about using bare interrupts or traps separately
+to handle hardware exceptions.
+
+So, how exactly is this implemented in modern-day Windows? Well, when your
+executable gets compiled, a table is created by the compiler that contains the
+metadata describing _all_ of the exception-handling code within the _entirety_
+of the module, and is stuffed into the [PE header](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format)
+of the `.exe`. Upon triggering an exception, the OS will look at the table, find
+the appropriate exception handler associated with it, and then execute it.
+
+For example, taking the following [sample C++ code from MSDN](https://docs.microsoft.com/en-us/cpp/cpp/writing-an-exception-filter?view=vs-2019):
+
+```cpp
+#include <windows.h>
+#include <stdio.h>
+int main() {
+   int Eval_Exception( int );
+
+   __try {}
+
+   __except ( Eval_Exception( GetExceptionCode( ))) {
+        printf("Exception handled");
+   }
+
+}
+
+
+BOOL SafeDiv(INT32 dividend, INT32 divisor, INT32 *pResult)
+{
+    __try
+    {
+        *pResult = dividend / divisor;
+    }
+    __except(GetExceptionCode() == EXCEPTION_INT_DIVIDE_BY_ZERO ?
+         EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+
+void ResetVars( int ) {
+    printf("Clean up code");
+}
+int Eval_Exception ( int n_except ) {
+   if ( n_except != STATUS_INTEGER_OVERFLOW &&
+      n_except != STATUS_FLOAT_OVERFLOW )   // Pass on most exceptions
+   return EXCEPTION_CONTINUE_SEARCH;
+
+   // Execute some code to clean up problem
+   ResetVars( 0 );   // initializes data to 0
+   return EXCEPTION_CONTINUE_EXECUTION;
+}
+```
+
+Compiles to this with `/Fa /Od` using x64 MSVC:
+
+```text
+?filt$0@?0??SafeDiv@@YAHHHPEAH@Z@4HA PROC       ; `SafeDiv'::`1'::filt$0
+    push    rbp
+    mov     rbp, rdx
+$LN7@filt$0:
+; Line 22
+    mov     QWORD PTR $T2[rbp], rcx
+    mov     rax, QWORD PTR $T2[rbp]
+    mov     rax, QWORD PTR [rax]
+    mov     eax, DWORD PTR [rax]
+    mov     DWORD PTR $T1[rbp], eax
+    mov     eax, DWORD PTR $T1[rbp]
+    cmp     eax, -1073741676            ; c0000094H
+    jne     SHORT $LN4@filt$0
+    mov     DWORD PTR tv67[rbp], 1
+    jmp     SHORT $LN5@filt$0
+$LN4@filt$0:
+    mov     DWORD PTR tv67[rbp], 0
+$LN5@filt$0:
+    mov     eax, DWORD PTR tv67[rbp]
+$LN9@filt$0:
+    pop     rbp
+    ret     0
+    int     3
+?filt$0@?0??SafeDiv@@YAHHHPEAH@Z@4HA ENDP       ; `SafeDiv'::`1'::filt$0
+```
+
+There's no trace of our exception handling code in there. If we look at the
+`.pdata` section of the compiled `.exe`, however:
+
+```text
+; Segment type: Pure data
+; Segment permissions: Read
+_pdata          segment para public 'DATA' use64
+                assume cs:_pdata
+                ;org 140085000h
+ExceptionDir    RUNTIME_FUNCTION <rva main, rva algn_140006C4D, rva stru_140079FD0>
+                RUNTIME_FUNCTION <rva ?SafeDiv@@YAHHHPEAH@Z, rva algn_140006C91, \ ; SafeDiv(int,int,int *)
+                                  rva stru_140079FF8>
+                RUNTIME_FUNCTION <rva ?ResetVars@@YAXH@Z, rva algn_140006CB9, \ ; ResetVars(int)
+                                  rva stru_14007A020>
+
+; The exception filter table entry
+                RUNTIME_FUNCTION <rva ?Eval_Exception@@YAHH@Z, rva byte_140006CF1, \ ; Eval_Exception(int)
+                                  rva stru_14007A028>
+
+                RUNTIME_FUNCTION <rva _vfprintf_l, rva byte_140006D73, \
+                                  rva stru_140079FC0>
+                RUNTIME_FUNCTION <rva printf, rva byte_140006DE7, rva stru_140079FC8>
+                RUNTIME_FUNCTION <rva pre_c_initialization, rva $LN19, \
+                                  rva stru_14007A064>
+                RUNTIME_FUNCTION <rva post_pgo_initialization, rva byte_140006EF0, \
+                                  rva stru_14007A06C>
+
+...
+```
+
+We see the table of metadata that the compiler stuffed inside the `.exe`, with
+our exception filter `Eval_Exception` listed. And if we look at what a
+`RUNTIME_FUNCTION`` is decompiled:
+
+```text
+RUNTIME_FUNCTION struc ; (sizeof=0xC, mappedto_1270)
+                                        ; XREF: .rdata:000000014007F054/r
+                                        ; .rdata:000000014007F068/r ...
+FunctionStart   dd ?                    ; offset rva
+FunctionEnd     dd ?                    ; offset rva pastend
+UnwindInfo      dd ?                    ; offset rva
+RUNTIME_FUNCTION ends
+```
+
+Which lines up nicely with what we see from the MSDN documentation:
+
+```cpp
+typedef struct _IMAGE_RUNTIME_FUNCTION_ENTRY {
+  DWORD BeginAddress;
+  DWORD EndAddress;
+  union {
+    DWORD UnwindInfoAddress;
+    DWORD UnwindData;
+  } DUMMYUNIONNAME;
+} RUNTIME_FUNCTION, *PRUNTIME_FUNCTION, _IMAGE_RUNTIME_FUNCTION_ENTRY, *_PIMAGE_RUNTIME_FUNCTION_ENTRY;
+```
+
+!!! tip
+    Keep in mind that even though this is on an x64 architecture, for
+    _reasons__, the offsets are actually from the _base_ of the image, and are
+    not addresses or pointers.
+
+The `UnwindInfoAddress` member points to an `UNWIND_INFO` structure, which looks
+like the following in IDA:
+
+```text
+UNWIND_INFO     struc ; (sizeof=0x4, mappedto_1271)
+                                        ; XREF: .rdata:stru_140079FC0/r
+                                        ; .rdata:stru_140079FC8/r ...
+Ver3_Flags      db ?                    ; base 16
+PrologSize      db ?                    ; base 16
+CntUnwindCodes  db ?                    ; base 16
+FrReg_FrRegOff  db ?                    ; base 16
+UNWIND_INFO     ends
+
+; ---------------------------------------------------------------------------
+
+UNWIND_CODE     struc ; (sizeof=0x2, mappedto_1272)
+                                        ; XREF: .rdata:0000000140079FC4/r
+                                        ; .rdata:0000000140079FCC/r ...
+PrologOff       db ?                    ; base 16
+OpCode_OpInfo   db ?                    ; base 16
+UNWIND_CODE     ends
+
+; ---------------------------------------------------------------------------
+
+C_SCOPE_TABLE   struc ; (sizeof=0x10, mappedto_1273)
+Begin           dd ?                    ; offset rva
+End             dd ?                    ; offset rva pastend
+Handler         dd ?                    ; offset rva
+Target          dd ?                    ; offset rva
+C_SCOPE_TABLE   ends
+```
+
+And again, lines up nicely with what we see according to MSDN:
+
+```cpp
+typedef struct _UNWIND_INFO {
+    UBYTE Version       : 3;
+    UBYTE Flags         : 5;
+    UBYTE SizeOfProlog;
+    UBYTE CountOfCodes;
+    UBYTE FrameRegister : 4;
+    UBYTE FrameOffset   : 4;
+    UNWIND_CODE UnwindCode[1];
+/*  UNWIND_CODE MoreUnwindCode[((CountOfCodes + 1) & ~1) - 1];
+*   union {
+*       OPTIONAL ULONG ExceptionHandler;
+*       OPTIONAL ULONG FunctionEntry;
+*   };
+*   OPTIONAL ULONG ExceptionData[]; */
+} UNWIND_INFO, *PUNWIND_INFO;
+```
+So, basically, if the `UnwindData` from the `RUNTIME_FUNCTION` structure has the
+`UNW_FLAG_EHANDLER` bit set, the `FunctionStart` and `FunctionEnd` members tell
+us where the function is in the `.exe` that makes use of SEH, and the
+`UnwindInfoAddress` points to a `_UNWIND_INFO_` struct that describes where the
+exception-handling code is within the procedure and its exception handlers.
+
+The `ExceptionData` is stored as an offset to a pointer to a `_SCOPE_TABLE`
+struct, which definition we can also find on MSDN:
+
+```cpp
+ typedef struct _SCOPE_TABLE {
+     ULONG Count;
+     struct
+     {
+         ULONG BeginAddress;
+         ULONG EndAddress;
+         ULONG HandlerAddress;
+         ULONG JumpTarget;
+     } ScopeRecord[1];
+ } SCOPE_TABLE, *PSCOPE_TABLE;
+```
+
+Finally, we find it: the `HandlerAddress` specifies the offset to the exception
+filter itself within the scope of the ``__except()`` statement itself. As you
+can see, MSVC does a _lot_ behind the scenes whenever you use SEH to make sure
+that the debugger is able to understand the context whenever an exception is
+encountered, and to invoke the appropriate behaviour.
+
+!!! tip
+    For more information,
+    [MSDN](https://docs.microsoft.com/en-us/cpp/build/exception-handling-x64?view=vs-2019)
+    has a great reference on this subject with more specific implementation
+    details, including the actual memory layout of the table and unwind
+    structures used to store the pointers to the exception handlers. You can
+    also take a look at [the x86 version](https://docs.microsoft.com/en-us/previous-versions/ms253960(v=vs.90)?redirectedfrom=MSDN)
+    as well for more information on the subject.
+
+This is in direct contrast to how exception handling was handled on x86; there,
+the compiler would build exception-handling structures and stuff it into each
+function's prolog as they were compiled, effectively forming a linked-list of
+exception handlers that would be stored on the stack at runtime. For security
+and performance reasons (i.e. [buffer overflow attacks targeting the exception
+information directly](https://www.exploit-db.com/docs/english/17505-structured-exception-handler-exploitation.pdf),
+along with the fact that this approach necessitated overhead in the common case
+since extra instructions would have to be executed to set up each function's
+prolog even if no exceptions were triggered), this approach fell out of favour
+with the move to the x64 calling conventions and architecture.
+
+!!! note Oh, so exceptions perform better?
+    This doesn't mean that exceptions are a good thing now. With the move
+    to a table-based storage, exceptions on x64 incur more overhead in terms of
+    the amount of memory required to store the exception handler information as
+    opposed to the linked-list stack-based scheme. Additionally, while overhead
+    in the normal execution path is now reduced drastically, the overhead
+    involved when an exception is _actually_ triggered now goes up dramatically,
+    since there is a lot more indirection involved in executing each
+    handler. This is (partially) why you'll notice the usual arguments regarding
+    whether exceptions should be used in general under high-performance
+    scenarios. We're not going to get into that discussion right now, but
+    suffice to say that to deal with writing crash handlers on Windows, you're
+    going to have to deal with exceptions, or SEH at the very least.
+
+So what does this mean for us, really? Well, we've learned:
+
+1. Windows uses SEH on x64, and has first-class support for it both in the
+   kernel, debuggers and compilers.
+
+2. Anytime we make use of `__try`, `__except`, `__finally` for MSVC,
+   the compiler creates a table in the PE header that contains data about all
+   the exception filters/handlers that are associated with each function scope
+   in your application, and where they are stored in the executable and when
+   they should be executed.
+
+Since we don't have the source code for Maya itself, we need a way to be able to
+tell the OS to use our own custom exception handler at runtime. Luckily, Windows
+provides us a few facilities to do so, and we'll be making use of them
+below. The first one we'll be going over is the **unhandled exception filter**,
+which, as its name implies, handles all exceptions that have been unhandled up
+to that point.
+
+## `SetUnhandledExceptionFilter` and what it does ##
+
+In addition to having special compiler-specific syntax to invoke SEH, Windows
+has an additional trick up its sleeve by also allowing each thread of a process
+to have its own **top-level exception handler**, that is, an exception handler
+that will be invoked if no other appropriate exception handlers can be found by
+the OS when one is triggered.
+
+!!! tip Different top-level exception filters per-thread?
+    Technically, while each thread can potentially have its own top-level
+    exception filter, calling `SetUnhandledExceptionFilter` will replace the
+    filter for _all_ threads in the process (and any newly-spawned ones as
+    well). However, it's important to note that when the filter is executed, it
+    executes only in the thread that _actually_ triggered the exception, and
+    only the context of that thread is available to the handler.
+
+Thus, we'll be making use of this in order to execute our exception-handling
+code, since it allows us to register our function at runtime. As a matter of
+fact, Maya (and most other win32 applications) already do this to allow them to
+register their own crash handlers for capturing dumps from their customers in
+order to help them analyze what went wrong.
+
+## Windows Error Reporting (WER) ##
+
+The next part of the exception handling workflow on Windows is **Windows Error
+Reporting**. By default, in modern Windows (starting around Vista),
+applications will now trigger WER when crashing, which basically spawns an
+out-of-process application (i.e. `werfault.exe`) that is responsible, if
+configured, to [collect user-mode dumps](https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps)
+from your application that just crashed in order to help you troubleshoot the
+issue. The out-of-process aspect means that this is much more robust against
+dealing with certain types of crashes (stack corruption, hangs, etc.). By
+default, if an SEH is triggered, no appropriate frame-based exception handlers
+were found, and the application has not registered any top-level unhandled
+exception filters, the OS will invoke WER after the application is terminated by
+the OS, allowing for writing a minidump (by default) for diagnostic
+purposes.
+
+However, there are several disadvantages to us working with WER and its exposed API:
+
+- It sends your data to Microsoft, and then you have to request it from
+  Microsoft after. Security and privacy notwithstanding, this is just ridiculous
+  in order to get information that really should be accessible directly to
+  developers without jumping through all these hoops (Yes, account registration
+  and approval from Microsoft is required).
+
+- The WER API itself is fairly limited and you don't really have control over
+  the actions taken by WER itself; you can essentially register blocks of memory
+  or ask for specific files to be included in your dump, but you can't really do
+  more than that. It's alright, but definitely not the same as being able to
+  execute arbitrary code from within an unhandled exception filter itself.
+
+!!! tip Possible usage of WER for this purpose...?
+    Capturing information from out-of-process rather than attempting to handle
+    exceptions and writing out a minidump from within the same process makes
+    total sense, and I do wish Microsoft hadn't designed the system to require
+    their explicit involvement in order to use.
+    However while I won't be investigating WER in this tutorial, I do
+    encourage you to read [this excellent series of articles](https://peteronprogramming.wordpress.com/2016/05/29/crashes-you-cant-handle-easily-1-seh-failure-on-x64-windows/)
+    on the subject of WER and potential workarounds for the problems listed above.
+
+That doesn't mean we're going to ignore WER, however; another nice trait about
+it is that if an unhandled exception filter _crashes_ while it is itself
+running, WER will _still_ get invoked and automatically write out a user-mode
+dump for us. That way, we can still get a callstack of what was involved in the
+crash. Let's go ahead and set it up to do so as-per [the instructions from MSDN](https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps).
+We'll want to specify the `DumpCount` to something more reasonable, like `30` or
+higher, capture a mini dump (By setting `DumpType` to `1`), and making sure that
+`DumpFolder` points to somewhere convenient and have access to.
+
+!!! tip Why not capture full dumps?
+    I actually normally do (and I recommend you do too when the situation calls
+    for it), but for the purposes of this tutorial, minidumps are faster to
+    write out, and in the first place, this tutorial is about putting our own
+    information that we want in a custom dump of our own that wouldn't be easily
+    accessible in a full dump anyway.
+
+As mentioned in MSDN, feel free to specialize the settings for just `maya.exe`
+if you'd like; otherwise, the settings you put in the registry will affect _all_
+programs that crash on your system, not just Maya itself.
+
+
+# Making Maya crash on-demand #
+
+Before we start writing code for our unhandled exception filter, let's write the
+code for our actual use case first: crashing Maya.
+
+## Types of exceptions ##
+
+Today, I'm just going to go over some of the more common ones that I run
+into. These are by no means comprehensive, and not all types of crashes might
+trigger SEH filters either (which I'll also demonstrate), so keep that in
+mind. The crashes that we'll tackle here are:
+
+1. Null pointer deference (By far, the #1 cause of concern)
+
+2. Out-of-bounds-access in STL containers
+
+3. Stack corruption
+
+4. Pure virtual function calls
+
+5. Stack overflow
+
+6. Calling `std::abort` directly
+
+I'll leave you to guess after looking at the code which ones we can deal with
+successfully, and which can't.
+
+
+## First/second-chance exceptions ##
+
+There's another concept we should probably go over before getting into writing
+code, which is the concept of **first-chance/second-chance** exceptions. On
+Windows, if you are running your program under the control of a debugger and
+encounter an exception, the OS will first notify the debugger _even before
+walking the exception table_ to find the appropriate exception handler, in order
+to give the debugger a chance to handle breakpoints or single-step
+exceptions. This is what's called the **first-chance notification**. After that,
+if ther OS cannot find any exception handlers to handle the exception, the OS
+will notify the debugger _again_ to allow it to possibly handle the exception or
+grab data from the process, before finally terminating the process being
+debugged itself.
+
+What does this concept mean for us? It means that if we want to test our
+exception handler, we _shouldn't do it with the debugger attached_, since the
+first-chance notification will kick in and stop us from further debugging the
+exception filter code itself. One hacky workaround is to have the exception
+filter raise a message dialog at the beginning of its execution either through
+`MessageBoxA` or similar (which will halt the application), so that the
+first-chance notification would already have passed, wait for the message box to
+display, _then_ attach the debugger to it in order to debug the code running in
+the exception filter itself.
+
+There are other ways to get around this, such as running the filter from
+_within_ an `__except` statement itself, like so:
+
+```cpp
+__try
+{
+    char *p = NULL;
+    *p = 5;
+}
+__except(mayaCustomUnhandledExceptionFilter(GetExceptionInformation()))
+{
+    printf("Handling exception.");
+}
+```
+
+This will cause the OS to _still_ notify the debugger (assuming we single-step
+or set a breakpoint on the print statement within the `__except`) after the
+first-chance when the exception is raised and not skip the `__except` clause,
+thus allowing us to debug the code within the filter itself.
+
+
+## Writing the command plug-in ##
+
+The boilerplate for the command should be pretty familiar to anyone who has
+written anything in Maya before, so I won't go over it in detail. We're
+basically going to make a new command called `mayaForceCrash`, which takes a
+`-crashType` argument and allows us to bring Maya down in various ways.
+
+Header file for our `MPxCommand` is as follows:
+```cpp
+#ifndef MAYA_CUSTOM_UNHANDLED_EXCEPTION_FILTER_CMD_H
+#define MAYA_CUSTOM_UNHANDLED_EXCEPTION_FILTER_CMD_H
+
+#include <maya/MPxCommand.h>
+#include <maya/MSyntax.h>
+#include <maya/MArgList.h>
+
+#define MAYA_FORCE_CRASH_CMD_NAME "mayaForceCrash"
+#define MAYA_CRASH_CMD_HELP_FLAG_SHORTNAME "-h"
+#define MAYA_CRASH_CMD_HELP_FLAG_NAME "-help"
+
+#define MAYA_CRASH_CMD_CRASH_TYPE_FLAG_SHORTNAME "-ct"
+#define MAYA_CRASH_CMD_CRASH_TYPE_FLAG_NAME "-crashType"
+
+#define MAYA_CRASH_CMD_HELP_TEXT "Triggers a crash for debugging purposes."
+
+enum MayaForceCrashType
+{
+    MayaForceCrashType_NoCrash = 0,
+    MayaForceCrashType_NullPtrDereference,
+    MayaForceCrashType_Abort,
+    MayaForceCrashType_OutOfBoundsAccess,
+    MayaForceCrashType_StackCorruption,
+    MayaForceCrashType_PureVirtualFuncCall,
+    MayaForceCrashType_StackOverflow
+};
+
+
+struct MayaForceCrashCmd : public MPxCommand
+{
+    static void *creator();
+
+    MStatus doIt(const MArgList &args);
+
+    MStatus redoIt();
+
+    MStatus undoIt();
+
+    bool isUndoable() const;
+
+    static MSyntax newSyntax();
+
+    MStatus parseArgs(const MArgList &args);
+
+    bool flagHelp;
+    int crashType;
+};
+
+#endif /* MAYA_CUSTOM_UNHANDLED_EXCEPTION_FILTER_CMD_H */
+```
+
+And the implementation:
+
+```cpp
+#include "maya_custom_unhandled_exception_filter_cmd.h"
+#include <maya/MArgDatabase.h>
+
+
+void *MayaForceCrashCmd::creator()
+{
+    MayaForceCrashCmd *cmd = new MayaForceCrashCmd();
+
+    cmd->flagHelp = false;
+    cmd->crashType = MayaForceCrashType_NoCrash;
+
+    return cmd;
+}
+
+
+MSyntax MayaForceCrashCmd::newSyntax()
+{
+    MSyntax syntax;
+
+    syntax.enableQuery(false);
+    syntax.enableEdit(false);
+    syntax.useSelectionAsDefault(false);
+
+    syntax.addFlag(MAYA_CRASH_CMD_HELP_FLAG_SHORTNAME,
+                   MAYA_CRASH_CMD_HELP_FLAG_NAME);
+
+    syntax.addFlag(MAYA_CRASH_CMD_CRASH_TYPE_FLAG_SHORTNAME,
+                   MAYA_CRASH_CMD_CRASH_TYPE_FLAG_NAME,
+                   MSyntax::kLong);
+
+    return syntax;
+}
+
+
+MStatus MayaForceCrashCmd::parseArgs(const MArgList &args)
+{
+    MStatus result;
+
+    MArgDatabase argDb(this->syntax(), args, &result);
+    CHECK_MSTATUS_AND_RETURN_IT(result);
+
+    if (argDb.isFlagSet(MAYA_CRASH_CMD_HELP_FLAG_SHORTNAME)) {
+        MGlobal::displayInfo(MAYA_CRASH_CMD_HELP_TEXT);
+        this->flagHelp = true;
+        return MStatus::kSuccess;
+    }
+
+    if (argDb.isFlagSet(MAYA_CRASH_CMD_CRASH_TYPE_FLAG_SHORTNAME)) {
+        result = argDb.getFlagArgument(MAYA_CRASH_CMD_CRASH_TYPE_FLAG_SHORTNAME, 0, this->crashType);
+        CHECK_MSTATUS_AND_RETURN_IT(result);
+    }
+
+    return result;
+}
+
+
+#pragma warning(disable : 4717)
+__declspec(noinline) void StackOverflow1 (volatile unsigned int* param)
+{
+  volatile unsigned int dummy[256];
+  dummy[*param] %= 256;
+
+  StackOverflow1 (&dummy[*param]);
+}
+
+
+MStatus MayaForceCrashCmd::redoIt()
+{
+    MStatus result = MStatus::kSuccess;
+
+    switch (this->crashType) {
+    case MayaForceCrashType_NullPtrDereference:
+    {
+        break;
+    }
+    case MayaForceCrashType_Abort: // TODO: (sonictk) This doesn't seem to call it either.
+    {
+        break;
+    }
+    case MayaForceCrashType_OutOfBoundsAccess:
+    {
+        break;
+    }
+    case MayaForceCrashType_StackCorruption:
+    {
+        break;
+    }
+    case MayaForceCrashType_PureVirtualFuncCall:
+    {
+        break;
+    }
+    case MayaForceCrashType_StackOverflow:
+    {
+        break;
+    }
+    case MayaForceCrashType_NoCrash:
+    default:
+        MGlobal::displayWarning("Invalid crash type specified.");
+        break;
+    }
+
+    return result;
+}
+
+
+MStatus MayaForceCrashCmd::doIt(const MArgList &args)
+{
+    this->clearResult();
+
+    MStatus stat = this->parseArgs(args);
+    CHECK_MSTATUS_AND_RETURN_IT(stat);
+
+    if (this->flagHelp == true) {
+        return MStatus::kSuccess;
+    }
+
+    return this->redoIt();
+}
+
+
+MStatus MayaForceCrashCmd::undoIt()
+{
+    return MStatus::kSuccess;
+}
+
+
+bool MayaForceCrashCmd::isUndoable() const
+{
+    return false;
+}
+```
+
+Pretty basic skeleton setup. So let's go ahead and start filling in the gaps for
+the crash logic, starting with the simplest (and yet most common) case: a `NULL`
+pointer deference.
+
+```cpp
+    case MayaForceCrashType_NullPtrDereference:
+    {
+        char *p = NULL;
+        *p = 5;
+        break;
+    }
+```
+
+Abort and out-of-bounds access are pretty straightforward as well:
+
+```cpp
+    case MayaForceCrashType_Abort:
+    {
+        abort();
+        break;
+    }
+    case MayaForceCrashType_OutOfBoundsAccess:
+    {
+        std::vector<int> v;
+        v[0] = 5;
+        break;
+    }
+```
+
+Simulating stack corruption is a little more tricky. Taking a trick
+from [peteronprogramming](https://peteronprogramming.wordpress.com/) here, we
+use a special MSVC intrinsic,
+[`_AddressOfReturnAddress`](https://docs.microsoft.com/en-us/cpp/intrinsics/addressofreturnaddress?view=vs-2019),
+that provides the return address of the current procedure. By overwriting what
+it returns with a garbage address, we essentially corrupt the stack ourselves.
+
+```cpp
+    case MayaForceCrashType_StackCorruption:
+    {
+        *(uintptr_t *)_AddressOfReturnAddress() = 0x1234;
+        break;
+    }
+```
+
+Another common problem in OOP-heavy codebases (which thankfully I don't deal
+much with personally, but professionally it is a never-ending nightmare) is
+inheritance and lots of interfaces. As such, pure virtual function calls are an
+unfortunate reality of most C++ codebases which we should simulate as well.
+
+```cpp
+    case MayaForceCrashType_PureVirtualFuncCall:
+    {
+        struct A
+        {
+            A() { bar(); }
+            virtual void foo() = 0;
+            void bar() { foo(); }
+        };
+
+        struct B: A
+        {
+            void foo() {}
+        };
+
+        A *a = new B;
+        a->foo();
+        break;
+    }
+```
+
+The final crash type we're going to test is stack overflow. Ha, ha. As it turns
+out, simulating it is just slightly tricky: we basically disable MSVC's stack
+overflow warnings, and also ensure that our function won't get inlined in order
+to take up as much stack space as possible.
+
+```cpp
+
+    #pragma warning(disable : 4717)
+    __declspec(noinline) void StackOverflow1 (volatile unsigned int* param)
+    {
+        volatile unsigned int dummy[256];
+        dummy[*param] %= 256;
+
+        StackOverflow1 (&dummy[*param]);
+    }
+
+    case MayaForceCrashType_StackOverflow: // TODO: (sonictk) Also doesn't get caught by the handlers.
+    {
+        unsigned int initial = 3;
+        StackOverflow1(&initial);
+        break;
+    }
+```
+
+With that, we should be able to run our `mayaForceCrash` command within Maya,
+and force Maya to exit in a few different ways. Great! Let's actually start
+writing the exception filter itself now.
+
+
+# Handling the crashes ourselves #
+
+The basic form of an unhandled exception filter is exceedingly simple. From
+MSDN:
+
+```cpp
+LONG WINAPI UnhandledExceptionFilter(
+  LPEXCEPTION_POINTERS exceptionInfo
+);
+```
+
+It is basically a callback function that returns a value to indicate to the
+system whether to continue searching for additional handlers, or whether to
+execute the handler directly. We pass it a pointer to an `_EXCEPTION_POINTERS`
+structure, which contains information about the exception that occurred along
+with the thread context in which it was triggered. Thus:
+
+```cpp
+LONG WINAPI mayaCustomUnhandledExceptionFilter(LPEXCEPTION_POINTERS exceptionInfo)
+{
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+```
+
+Will be the basic skeleton of the handler, and we register this when we first
+initialize the Maya plugin:
+
+```cpp
+static LPTOP_LEVEL_EXCEPTION_FILTER gPrevFilter = NULL;
+
+
+MStatus initializePlugin(MObject obj)
+{
+    MFnPlugin plugin(obj, PLUGIN_AUTHOR, PLUGIN_VERSION, PLUGIN_REQUIRED_API_VERSION);
+
+    gPrevFilter = ::SetUnhandledExceptionFilter(mayaCustomUnhandledExceptionFilter);
+
+    mstat  = plugin.registerCommand(MAYA_FORCE_CRASH_CMD_NAME,
+                                    MayaForceCrashCmd::creator,
+                                    MayaForceCrashCmd::newSyntax);
+
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    return mstat;
+}
+```
+
+Since `SetUnhandledExceptionFilter` returns the previous top-level exception
+filter that was in use, we can make use of that to ensure that when we unload
+our plug-in, we also restore the original Maya one as well:
+
+```cpp
+MStatus uninitializePlugin(MObject obj)
+{
+    ::SetUnhandledExceptionFilter(gPrevFilter);
+
+    MFnPlugin plugin(obj);
+    mstat = plugin.deregisterCommand(MAYA_FORCE_CRASH_CMD_NAME);
+
+    return mstat;
+}
+```
+
+That's it! Technically, after writing this code, any time you load your plug-in
+within Maya now, you should have overridden Maya's in-built crash handler, and
+it will now execute our own code when Maya encounters any unhandled exceptions
+under SEH. Obviously, however, our filter doesn't really do anything at the
+moment. Let's start changing that, and at the same time, plan out what exactly
+it is our filter needs to do.
+
+## What our filter will do ##
+
+So, now that we have a basic skeleton of our filter written out, what exactly do
+we want it to do? Well, first of all, it would be nice to be able to store some
+additional information in a minidump that would normally not be possible through
+either WER or that the default Maya crash handler doesn't do for us. For
+example, what if I could store the last MEL proc that executed, or the last
+change to the DAG that an end-user did? Or heck, even storing basic information
+such as the Maya scene that the user had open, along with the Maya referenced
+files and/or textures in that scene would already be useful.
+
+For starters, we're going to be focusing on implementing the following:
+
+***********************************************************************************
+*                                                                                 *
+*                       custom plugin dll                                         *
+*                  +--------------------------------------+                       *
+*                  |                                      |                       *
+*                  |   +-------------------------------+  |               3.      *
+*                  |   |                               |----------------------.   *
+*                  |   |     Custom unhandled exception|  |                    |  *
+*                  |   |          filter proc          |<------------------.   |  *
+*                  |   +-------------------------------+  |                 |  |  *
+*                  |   |                               |  |                 |  |  *
+*                  |   | Storage for useful information|  |                 |  |  *
+*                  |   | captured during the Maya      |  |                 |  |  *
+*                  |   | session (scene filename,      |  |                 |  |  *
+*                  |   | DAG changes, MEL procs, etc.) |  |                 |  |  *
+*                  |   +-------------------------------+  |                 |  |  *
+*                  +-------------+------------------------+                 |  |  *
+*                                |                                          |  |  *
+*   SetUnhandledExceptionFilter  | 1.                                       |  |  *
+*    overrides Maya's default    |           +------------------------+     |  |  *
+*    top-level unhandled         |           |                        |     |  |  *
+*     exception handler          |           |      maya.exe          |     |  |  *
+*                                 '---------->                        |     |  |  *
+*                                            +----------+-------------+     |  |  *
+*                                                       |                   |  |  *
+*                        Unhandled exception is thrown  | 2.                |  |  *
+*                         and OS invokes the top-level  |                   |  |  *
+*                            filter to handle it         '-----------------'   |  *
+*                             (no debugger)                                    |  *
+*                                                                              |  *
+*                                                                              |  *
+*                                                                              |  *
+*                                                                              |  *
+*                                                                              |  *
+*                                     .---------------------------------------'   *
+*                                    |                                            *
+*                                    |                                            *
+*                                    |                                            *
+*                                    |                                            *
+*                                    v                                            *
+*                     +--------------------------------+                          *
+*                     |   Writes out minidump to disk  |                          *
+*                     |  with additional Maya-specific |                          *
+*                     |  context                       |                          *
+*                     |                                |                          *
+*                     |                                |                          *
+*                     |                                |                          *
+*                     +--------------------------------+                          *
+*                                                                                 *
+***********************************************************************************
+[Figure [diagram]: The initial implementation.]
+
+We already implemented a little bit of Step 1, so let's go ahead and implement
+a few examples of storing some Maya-specific context within our plug-in's `.bss`
+data segment that could be useful when we're debugging our crash dump later on.
+
+!!! tip Why store in the `.bss` segment?
+    No particular reason: you could also pre-allocate some memory from the heap
+    and that would essentially serve the same purpose as storing it as global
+    variables. However, what I would advise against is calling into Maya
+    functions or even doing anything with the heap _at_ the time of the crash
+    itself, as you can't reason fully about the state of the program at that
+    point, and it's far less risky to just read from `.bss` data or some other
+    pre-allocated memory location rather than enter new function calls or make
+    syscalls to allocate new pages of memory, etc.
+
+Let's start with something simple: storing the path to the current Maya scene
+(if any).
+
+```cpp
+static char gMayaCurrentScenePath[MAX_PATH] = {0};
+
+
+void mayaSceneAfterOpenCB(void *unused)
+{
+    (void)unused;
+
+    const MString curFileNameMStr = MFileIO::currentFile();
+    const unsigned int lenCurFileName = curFileNameMStr.length();
+    memcpy(gMayaCurrentScenePath, curFileNameMStr.asChar(), lenCurFileName);
+    memset(gMayaCurrentScenePath + lenCurFileName, 0, 1);
+
+    return;
+}
+
+
+MStatus initializePlugin(MObject obj)
+{
+    MFnPlugin plugin(obj, PLUGIN_AUTHOR, PLUGIN_VERSION, PLUGIN_REQUIRED_API_VERSION);
+
+    gPrevFilter = ::SetUnhandledExceptionFilter(mayaCustomUnhandledExceptionFilter);
+
+    MStatus mstat;
+    gMayaSceneAfterOpen_cbid = MSceneMessage::addCallback(MSceneMessage::kAfterOpen, mayaSceneAfterOpenCB, NULL, &mstat);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    mayaSceneAfterOpenCB(NULL);
+
+    mstat  = plugin.registerCommand(MAYA_FORCE_CRASH_CMD_NAME,
+                                    MayaForceCrashCmd::creator,
+                                    MayaForceCrashCmd::newSyntax);
+
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    return mstat;
+}
+
+
+MStatus uninitializePlugin(MObject obj)
+{
+    ::SetUnhandledExceptionFilter(gPrevFilter);
+    MStatus mstat = MMessage::removeCallback(gMayaSceneAfterOpen_cbid);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    MFnPlugin plugin(obj);
+    mstat = plugin.deregisterCommand(MAYA_FORCE_CRASH_CMD_NAME);
+
+    return mstat;
+}
+```
+
+Again, very straightforward stuff with the Maya API: we register a callback to
+record the scene filename every time a new scene is opened, and update the
+global variable each time that happens. That way, when we do hit a crash, we
+don't need to call any functions, and just need to read from the already-written
+memory to get our string.
+
+Very good; we now are able to save the most basic of information about the scene
+state when switching Maya scenes, and storing it somewhere readily accessible
+when we hit a crash. Let's go ahead and take on Step 3, where we actually now
+write this information to disk.
+
+## Writing the Unhandled Exception Filter ##
+
+Let's fill out the handler a little bit with some rudimentary logic to prepare
+for writing the dump file:
+
+```cpp
+#define MINIDUMP_FILE_NAME "MayaCustomCrashDump.dmp"
+#define DEFAULT_TEMP_DIRECTORY "C:/temp"
+#define TEMP_ENV_VAR_NAME "TEMP"
+
+LONG WINAPI mayaCustomUnhandledExceptionFilter(LPEXCEPTION_POINTERS exceptionInfo)
+{
+    char tempDirPath[MAX_PATH] = {0};
+    DWORD lenTempDirPath = ::GetEnvironmentVariable((LPCTSTR)TEMP_ENV_VAR_NAME, (LPTSTR)tempDirPath, (DWORD)MAX_PATH);
+    if (lenTempDirPath == 0) {
+        static const size_t lenDefaultTempDirPath = strlen(DEFAULT_TEMP_DIRECTORY);
+        memcpy(tempDirPath, DEFAULT_TEMP_DIRECTORY, lenDefaultTempDirPath);
+        memset(tempDirPath + lenDefaultTempDirPath, 0, 1);
+    }
+    char dumpFilePath[MAX_PATH] = {0};
+    snprintf(dumpFilePath, MAX_PATH, "%s\\%s", tempDirPath, MINIDUMP_FILE_NAME);
+    HANDLE hFile = CreateFile(dumpFilePath, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == NULL || hFile == INVALID_HANDLE_VALUE) {
+        ::MessageBoxA(NULL, MSG_UNABLE_TO_WRITE_DUMP, MSG_UNHANDLED_EXCEPTION, MB_OK|MB_ICONSTOP);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    CloseHandle(hFile);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+```
+
+Even if you're familiar with Win32 API code, this should be pretty
+self-explanatory: we find the system's temporary directory as defined by the
+`%TMP%` environment variable and open a file handle to a new minidump file,
+`MayaCustomCrashDump.dmp`, where we can write into in the next step, falling
+back appropriately on defaults if the system-provided environment variables
+aren't available. If we can't open the file handle, we just raise an error
+dialog, and tell the system to proceed with normal execution (which, since we
+are already the top-level filter, should pop up the infamous "Application Error"
+dialog box depending on the behaviour of the app via `SetErrorMode`.) by
+returning `EXCEPTION_CONTINUE_SEARCH`.  If we _do_ succeed, we tell the system
+to return from our handler, which usually just means that the system will
+terminate the application straightaway after since again, we are the top-level
+exception filter for the application at this point.
+
+Great! Let's go ahead and take a look at the structure of a minidump on Windows,
+and how we can stuff the information we want about the Maya scene into it.
+
+### Custom user streams ###
+
+Minidumps start with a `MINIDUMP_EXCEPTION_INFORMATION` structure, which looks
+like the following:
+
+```cpp
+typedef struct _MINIDUMP_EXCEPTION_INFORMATION {
+  DWORD               ThreadId;
+  PEXCEPTION_POINTERS ExceptionPointers;
+  BOOL                ClientPointers;
+} MINIDUMP_EXCEPTION_INFORMATION, *PMINIDUMP_EXCEPTION_INFORMATION;
+```
+
+This is trivial to fill out as the exception information is already passed into
+our filter when it is invoked, as shown below:
+
+```cpp
+    MINIDUMP_EXCEPTION_INFORMATION dumpExceptionInfo = {0};
+    dumpExceptionInfo.ThreadId = ::GetCurrentThreadId();
+    dumpExceptionInfo.ExceptionPointers = exceptionInfo;
+    dumpExceptionInfo.ClientPointers = TRUE;
+```
+
+The `ClientPointers` member merely indicates if the memory regions referred to
+by `ExceptionPointers` resides in the same process being debugged by the
+debugger. The answer is yes (since we are going to be debugging `maya.exe` when
+inspecting our minidump, not the debugger process itself), thus we set it to
+`TRUE`.
+
+The next step is storing our own data within the dump. For that, we need a
+`MINIDUMP_USER_STREAM` structure instead:
+
+```cpp
+typedef struct _MINIDUMP_USER_STREAM {
+  ULONG32 Type;
+  ULONG   BufferSize;
+  PVOID   Buffer;
+} MINIDUMP_USER_STREAM, *PMINIDUMP_USER_STREAM;
+```
+
+Again, nothing complicated. I'm liking this a lot already! We basically have a
+variable-length buffer that has a size indicated, and has a
+`MINIDUMP_STREAM_TYPE` to indicate its type. For our purposes, we're going to
+specify a type of `CommentStreamA`, which means we're just storing an ANSI
+string (i.e. the path to our Maya scene) in the dump for later review during debugging.
+
+!!! tip
+    If you have Unicode file paths, you can modify the code above to store
+    `wchar_t` file paths and specify `CommentStreamW` if you'd prefer. Remember
+    to use the correct string handling functions and account for the increased
+    buffer size as well!
+
+```cpp
+    MINIDUMP_USER_STREAM dumpMayaFileInfo = {0};
+    dumpMayaFileInfo.Type = CommentStreamA;
+    dumpMayaFileInfo.BufferSize = MAX_PATH;
+    dumpMayaFileInfo.Buffer = gMayaCurrentScenePath;
+```
+
+We then need to stuff our stream into another structure. From MSDN:
+
+```cpp
+typedef struct _MINIDUMP_USER_STREAM_INFORMATION {
+  ULONG                 UserStreamCount;
+  PMINIDUMP_USER_STREAM UserStreamArray;
+} MINIDUMP_USER_STREAM_INFORMATION, *PMINIDUMP_USER_STREAM_INFORMATION;
+```
+
+Again, nothing complicated, just a structure that points to an array of
+`MINIDUMP_USER_STREAM` strucutres:
+
+```cpp
+    #define ARRAY_SIZE(x) sizeof(x) / sizeof(x[0])
+
+    MINIDUMP_USER_STREAM streams[] = {
+        dumpMayaFileInfo
+    };
+    MINIDUMP_USER_STREAM_INFORMATION dumpUserInfo = {0};
+    dumpUserInfo.UserStreamCount = ARRAY_SIZE(streams);
+    dumpUserInfo.UserStreamArray = streams;
+```
+
+And that's it! We're now ready to write the actual dump out to disk.
+
+### Writing the minidump ###
+
+Windows helpfully provides the `MiniDumpWriteDump` function for us to be able to
+write out dumps to disk from the current process. It's also fairly
+straightforward:
+
+```cpp
+BOOL MiniDumpWriteDump(
+  HANDLE                            hProcess,
+  DWORD                             ProcessId,
+  HANDLE                            hFile,
+  MINIDUMP_TYPE                     DumpType,
+  PMINIDUMP_EXCEPTION_INFORMATION   ExceptionParam,
+  PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
+  PMINIDUMP_CALLBACK_INFORMATION    CallbackParam
+);
+```
+
+Thus, we can do the following to write out our own dump from within our
+exception handler:
+
+```cpp
+    // ... previous code in the exception handler
+    static const DWORD miniDumpFlags = MiniDumpNormal;
+    BOOL dumpWritten = ::MiniDumpWriteDump(::GetCurrentProcess(), ::GetCurrentProcessId(), hFile, (MINIDUMP_TYPE)miniDumpFlags, &dumpExceptionInfo, &dumpUserInfo, NULL);
+    if (dumpWritten == false) {
+        ::MessageBoxA(NULL, MSG_UNABLE_TO_WRITE_DUMP, MSG_UNHANDLED_EXCEPTION, MB_OK|MB_ICONSTOP);
+        return EXCEPTION_CONTINUE_SEARCH;
+    } else {
+        char msg[MAX_PATH] = {0};
+        snprintf(msg, MAX_PATH, "An unrecoverable error has occured and the application will now close.\nA minidump file has been written to the following location for debugging purposes:\n%s", dumpFilePath);
+        ::MessageBoxA(NULL, msg, MSG_UNHANDLED_EXCEPTION, MB_OK|MB_ICONSTOP);
+    }
+
+    CloseHandle(hFile);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+```
+
+This should all be pretty obvious. We attempt to write out the dump file using
+the structures that we have set up previously, check if it succeeds, and either
+show an error message with the path to the dump file that was written out for
+the end-user's convenience, or, if an error occurred while attempting to write
+out the dump, exit our handler and allow normal execution to resume (which
+should have Windows show the Application Error pop-up dialog). Finally, we close
+the file handle to the dump file and we're done!
+
+Go ahead and try now. Enter `mayaForceCrash -ct <number>`, and see our crash
+handler get invoked instead of Maya's own!
+
+![Crash handler dialog](./imgs/crash_dialog_preview.png)
+
+If you open the crash in WinDbg and analyze it (`!analyze -v`), you should also
+now see your scene name that we previously stored in a custom user stream now
+show up in the debugger output as well:
+
+```text
+COMMENT:  C:/Users/sonictk/Documents/maya/projects/default/untitled
+```
+
+Great, so we're done! Right? Well, no.
+
+Try executing a crash that involves stack corruption. For reference, that's this
+bit of code here that we typed earlier:
+
+```cpp
+    case MayaForceCrashType_StackCorruption:
+    {
+        *(uintptr_t *)_AddressOfReturnAddress() = 0x1234;
+        break;
+    }
+```
+
+Go on, I'll wait.
+
+...
+
+Back yet? Did you notice that our exception handler didn't get executed?
+However, because we have WER enabled, you should now be able to go to the
+directory described earlier in your `DumpsFolder` registry key and find your
+crash dump there. Open it in WinDbg and print the stack (If you're new to WinDbg,
+the command is `kP`). You should see the following (additional tables removed
+for brevity):
+
+```text
+0:000> kP
+ #      Call Site
+00      0x1234
+01      0x0000008d`08ffa648
+02      0x0000008d`08ffa648
+03      0x0000008d`08ffa670
+04      OpenMayaRender!Autodesk::Maya::OpenMaya20200000::MFnAdskMaterial::type+0x11130
+05      0x000001bc`1301ff00
+06      0x4b082205`5ec939ec
+07      0x000001bc`1320c860
+08      OpenMaya!THcommandObject::doIt+0xb1
+09      CommandEngine!TmetaCommand::doCommand+0x68
+0a      CommandEngine!Tjournal::operator=+0x5f2
+0b      CommandEngine!setMelGlobalStackLevelPtr+0x218
+0c      CommandEngine!TmelVariableList::`default constructor closure'+0xbc97
+0d      CommandEngine!TmelVariableList::`default constructor closure'+0xbde4
+0e      CommandEngine!SophiaExecutable::evaluate+0x47
+0f      CommandEngine!TcommandEngine::executeCommand+0x3bd
+10      ExtensionLayer!QmayaCommandScrollFieldExecuter::doCommandCompletion+0x2f1
+11      ExtensionLayer!TidleAction::preDoIdleAction+0xf
+12      ExtensionLayer!TidleAction::destroyAfterRunning+0x23
+13      ExtensionLayer!TidleLicenseAction::~TidleLicenseAction+0x16f
+14      ExtensionLayer!TeventHandler::doIdles+0x371
+15      ExtensionLayer!TeventHandler::suspendIdleEvents+0x10f
+16      Qt5Core!QObject::event+0x91
+17      Qt5Widgets!QApplicationPrivate::notify_helper+0x13d
+18      Qt5Widgets!QApplication::notify+0x1ba7
+19      ExtensionLayer!QmayaApplication::currentMousePos+0x6fa
+1a      Qt5Core!QCoreApplication::notifyInternal2+0xb9
+1b      Qt5Core!QEventDispatcherWin32::event+0xef
+1c      Qt5Widgets!QApplicationPrivate::notify_helper+0x13d
+1d      Qt5Widgets!QApplication::notify+0x1ba7
+1e      ExtensionLayer!QmayaApplication::currentMousePos+0x6fa
+1f      Qt5Core!QCoreApplication::notifyInternal2+0xb9
+20      Qt5Core!QCoreApplicationPrivate::sendPostedEvents+0x228
+21      qwindows!qt_plugin_query_metadata+0x1ebf
+22      Qt5Core!QEventDispatcherWin32::processEvents+0xde9
+23      user32!UserCallWinProcCheckWow+0x2bd
+24      user32!DispatchMessageWorker+0x1e2
+25      Qt5Core!QEventDispatcherWin32::processEvents+0x5db
+26      qwindows!qt_plugin_query_metadata+0x1e99
+27      Qt5Core!QEventLoop::exec+0x1fb
+28      Qt5Core!QCoreApplication::exec+0x15e
+29      ExtensionLayer!Tapplication::start+0xd8
+2a      maya!TiteratorWrapperFwd<TscenePartitions::ConstIteratorDescriptor,TiteratorWrapper<TscenePartitions::ConstIteratorDescriptor> >::operator+++0xfe5
+2b      maya!TiteratorWrapperFwd<TscenePartitions::ConstIteratorDescriptor,TiteratorWrapper<TscenePartitions::ConstIteratorDescriptor> >::operator+++0x130c7
+2c      maya!TiteratorWrapperFwd<TscenePartitions::ConstIteratorDescriptor,TiteratorWrapper<TscenePartitions::ConstIteratorDescriptor> >::operator+++0x12116
+2d      kernel32!BaseThreadInitThunk+0x14
+2e      ntdll!RtlUserThreadStart+0x21
+```
+
+Oh, what's that at the top of the stack? Isn't that our randomly chosen address
+that we used to corrupt the stack with, why yes it is! More curiously, what does
+the auto-analysis (invoked with `!analyze -v`) try to tell us happened?
+
+```text
+0:000> !analyze -v
+*******************************************************************************
+*                                                                             *
+*                        Exception Analysis                                   *
+*                                                                             *
+*******************************************************************************
+
+*** WARNING: Unable to verify checksum for mayaOpenImageIO.dll
+
+KEY_VALUES_STRING: 1
+
+    Key  : AV.Fault
+    Value: Execute
+
+    Key  : Analysis.CPU.mSec
+    Value: 2140
+
+    Key  : Analysis.DebugAnalysisProvider.CPP
+    Value: Create: 8007007e on <redacted>
+
+    Key  : Analysis.DebugData
+    Value: CreateObject
+
+    Key  : Analysis.DebugModel
+    Value: CreateObject
+
+    Key  : Analysis.Elapsed.mSec
+    Value: 31614
+
+    Key  : Analysis.Memory.CommitPeak.Mb
+    Value: 412
+
+    Key  : Analysis.System
+    Value: CreateObject
+
+    Key  : Timeline.Process.Start.DeltaSec
+    Value: 83190
+
+    Key  : WER.OS.Branch
+    Value: 19h1_release
+
+    Key  : WER.OS.Timestamp
+    Value: 2019-03-18T12:02:00Z
+
+    Key  : WER.OS.Version
+    Value: 10.0.18362.1
+
+    Key  : WER.Process.Version
+    Value: 21.0.0.524
+
+
+ADDITIONAL_XML: 1
+
+OS_BUILD_LAYERS: 1
+
+NTGLOBALFLAG:  0
+
+PROCESS_BAM_CURRENT_THROTTLED: 0
+
+PROCESS_BAM_PREVIOUS_THROTTLED: 0
+
+APPLICATION_VERIFIER_FLAGS:  0
+
+CONTEXT:  (.ecxr)
+rax=0000008d08ffa670 rbx=0000008d08ffa648 rcx=00007ffa47e522e5
+rdx=00007ffa47e50000 rsi=000001bc1321a770 rdi=0000008d08ffa670
+rip=0000000000001234 rsp=0000008d08ffa5e0 rbp=0000008d08ffa729
+ r8=00000000000000ff  r9=0000000000000001 r10=0000000000008000
+r11=0000008d08ffa5d0 r12=0000000000000001 r13=0000000000000001
+r14=0000000000000001 r15=000001bc1320c520
+iopl=0         nv up ei pl nz na pe nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010200
+00000000`00001234 ??              ???
+Resetting default scope
+
+EXCEPTION_RECORD:  (.exr -1)
+ExceptionAddress: 0000000000001234
+   ExceptionCode: c0000005 (Access violation)
+  ExceptionFlags: 00000000
+NumberParameters: 2
+   Parameter[0]: 0000000000000008
+   Parameter[1]: 0000000000001234
+Attempt to execute non-executable address 0000000000001234
+
+PROCESS_NAME:  maya.exe
+
+EXECUTE_ADDRESS: 1234
+
+FAILED_INSTRUCTION_ADDRESS:
++0
+00000000`00001234 ??              ???
+
+ERROR_CODE: (NTSTATUS) 0xc0000005 - The instruction at 0x%p referenced memory at 0x%p. The memory could not be %s.
+
+EXCEPTION_CODE_STR:  c0000005
+
+EXCEPTION_PARAMETER1:  0000000000000008
+
+EXCEPTION_PARAMETER2:  0000000000001234
+
+IP_ON_HEAP:  0000000000001234
+The fault address in not in any loaded module, please check your build's rebase
+log at <releasedir>\bin\build_logs\timebuild\ntrebase.log for module which may
+contain the address if it were loaded.
+
+IP_ON_STACK:
++0
+0000008d`08ffa648 f0              ???
+
+FRAME_ONE_INVALID: 1
+
+...
+
+SYMBOL_NAME:  openmayarender!Autodesk::Maya::OpenMaya20200000::MFnAdskMaterial::type+11130
+
+MODULE_NAME: OpenMayaRender
+
+IMAGE_NAME:  OpenMayaRender.dll
+
+STACK_COMMAND:  ~0s ; .ecxr ; kb
+
+FAILURE_BUCKET_ID:  SOFTWARE_NX_FAULT_CODE_c0000005_OpenMayaRender.dll!Autodesk::Maya::OpenMaya20200000::MFnAdskMaterial::type
+
+OS_VERSION:  10.0.18362.1
+
+BUILDLAB_STR:  19h1_release
+
+OSPLATFORM_TYPE:  x64
+
+OSNAME:  Windows 10
+
+IMAGE_VERSION:  21.0.0.524
+
+FAILURE_ID_HASH:  {c7389fa3-e6f6-36c4-c2c4-ad5882805143}
+
+Followup:     MachineOwner
+---------
+```
+
+Yea, so if you weren't paying attention and just looking at the auto-analysis,
+you might be thinking "huh, it's a bug somewhere in Maya". Luckily, this time we
+used a pretty obvious address. What if it was something that was far less
+discernable, especially in a production setting?
+
+## Adding a Vectored Exception Filter ##
+
+One way to help us catch some of these types of crashes (though not always) is
+using an extension to Structured Exception Handling, known as **Vectored
+Exception Filters**. They are [basically filters that are executed _before_ any
+of the SEH filters](https://docs.microsoft.com/en-us/windows/win32/debug/vectored-exception-handling),
+and unlike SEH filters, are not frame-based and not tied to any specific
+function. However, they still behave the same way as SEH filters do when it
+comes to debuggers being present, which we'll discuss later on near the end of
+this document. One other advantage they have, unlike SEH filters, is that you
+can add multiple handlers, unlike `SetUnhandledExceptionFilter`, which only
+allows you to set a single handler as the top-level one for the entire process.
+
+!!! tip So what's the catch?
+    Well, because vectored exception handlers are implemented as a linked-list
+    of registered handlers, walking the list if you have a lot of these handlers
+    registered is potentially a hit on performance when triggering an
+    exception. There's also
+    [other esoteric issues](https://chromium.googlesource.com/native_client/src/native_client/+/bradnelson/pnacl-in-pnacl/documentation/windows_ntdll_patch.txt) involved
+    with VEHs. Fortunately for us, we shouldn't run into any of these with our
+    plug-in specifically, but make a decision for yourself based on your general
+    codebase and the style chosen within it: are you exception-heavy, or not?
+
+Let's go ahead and add one to our plug-in in the `initializePlugin` when it is loaded:
+
+```cpp
+static PVECTORED_EXCEPTION_HANDLER gpVectoredHandler = NULL;
+
+LONG WINAPI mayaCustomVectoredExceptionHandler(PEXCEPTION_POINTERS exceptionInfo)
+{
+    LONG result = mayaCustomUnhandledExceptionFilter(exceptionInfo);
+    return result;
+}
+
+MStatus initializePlugin(MObject obj)
+{
+    MFnPlugin plugin(obj, PLUGIN_AUTHOR, PLUGIN_VERSION, PLUGIN_REQUIRED_API_VERSION);
+    gpVectoredHandler = (PVECTORED_EXCEPTION_HANDLER)::AddVectoredExceptionHandler(1, mayaCustomVectoredExceptionHandler);
+    gPrevFilter = ::SetUnhandledExceptionFilter(mayaCustomUnhandledExceptionFilter);
+
+    // ...more code below
+```
+
+As you can see, we just call the existing SEH filter that we've already made.
+And let's make sure we remove it in `uninitializePlugin` as well:
+
+```cpp
+if (gpVectoredHandler != NULL) {
+    ULONG stat = ::RemoveVectoredExceptionHandler(gpVectoredHandler);
+    if (stat == 0) {
+        MGlobal::displayError("Could not remove the vectored exception handler.");
+        return MStatus::kFailure;
+    }
+}
+```
+
+Go ahead and try the same crash now. You should see our custom crash
+`MessageBox` show up.
+
+Now try a normal simple null pointer deference crash:
+
+```cpp
+char *p = NULL;
+*p = 5;
+```
+
+Uh oh. The dialog showed up twice! If you step through the code, _both_ the
+vectored exception filter _and_ the unhandled exception filter are being run one
+after the other. Let's stop that by basically storing a global to check if the
+filter has already run before, and if so, not to run it again:
+
+```cpp
+static bool gHandlerCalled = false;
+
+LONG WINAPI mayaCustomVectoredExceptionHandler(PEXCEPTION_POINTERS exceptionInfo)
+{
+    LONG result = mayaCustomUnhandledExceptionFilter(exceptionInfo);
+    gHandlerCalled = true;
+    return result;
+}
+
+LONG WINAPI mayaCustomUnhandledExceptionFilter(LPEXCEPTION_POINTERS exceptionInfo)
+{
+    if (gHandlerCalled == true) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    char tempDirPath[MAX_PATH] = {0};
+    DWORD lenTempDirPath = ::GetEnvironmentVariable((LPCTSTR)TEMP_ENV_VAR_NAME, (LPTSTR)tempDirPath, (DWORD)MAX_PATH);
+    if (lenTempDirPath == 0) {
+        static const size_t lenDefaultTempDirPath = strlen(DEFAULT_TEMP_DIRECTORY);
+        memcpy(tempDirPath, DEFAULT_TEMP_DIRECTORY, lenDefaultTempDirPath);
+        memset(tempDirPath + lenDefaultTempDirPath, 0, 1);
+    }
+    char dumpFilePath[MAX_PATH] = {0};
+    snprintf(dumpFilePath, MAX_PATH, "%s\\%s", tempDirPath, MINIDUMP_FILE_NAME);
+
+    ...
+```
+
+Now if you run it again, we should be catching both `NULL` pointer deferences,
+``std::vector`` out of bounds accesses, _and_ stack corruption as well for the
+obvious cases! Great!
+
+Ok, let's try something that you'll probably have had to deal with at some point
+in your life (or maybe a lot, if you're unfortunate enough to be working on a
+heavily OOP-ed codebase):
+
+```cpp
+struct A
+{
+    A() { bar(); }
+    virtual void foo() = 0;
+    void bar() { foo(); }
+};
+
+struct B: A
+{
+    void foo() {}
+};
+
+A *a = new B;
+a->foo();
+```
+
+Yep, the dreaded pure virtual function call. Go ahead and run this code; spoiler
+alert, it won't get picked up. Why is this?
+
+Well, it turns out that exceptions generated from the C runtime libraries (CRT)
+have their own error handling mechanisms on Windows. The actual implementation
+isn't well-documented, and this has changed over the years (for example, the
+Section Walking the Import Address Table (IAT) technique works differently when
+compiled under MSVC 2008 versus a more modern compiler, which I found to my
+absolute dismay during the course of writing the sample code for this
+article). What we do have though, in 2020, are a bunch of ways to register
+different types of exception handlers for the various different types of CRT
+exceptions that can be triggered.
+
+Let's go over a few of them, starting, obviously, with the case we just
+identified above.
+
+## Catching CRT exceptions ##
+
+Whenever a CRT exception is raised on Windows, invariably, `terminate()`
+will get called at some point. There even exists a function in the standard,
+`set_terminate()` for setting the error handler function.
+
+### Dealing with pure virtual function calls ###
+
+However, for pure virtual function calls, MSVC provides a special intrinsic,
+`_set_purecall_handler`, that will allow us to override the default error
+handler function that the compiler generates normally for such calls.
+
+The function signature for the handler itself is pretty basic:
+
+```cpp
+void purecall_handler(void);
+```
+
+However, this presents us with an issue: we don't get the `EXCEPTION_POINTERS`
+structure here, so how are we going to fire off the exception?
+
+The answer is, surprisingly fairly straightforward: we'll create the exception
+record by ourselves. Thankfully, thanks to
+[some sleuthing done by CrashRpt for us already](http://crashrpt.sourceforge.net/docs/html/exception_handling.html#getting_exception_context),
+we see that this is not as ardous as it might sound like: the Windows CRT
+implementation already has a solution for us:
+
+```cpp
+_CRTIMP void __cdecl _invoke_watson(
+    const wchar_t *pszExpression,
+    const wchar_t *pszFunction,
+    const wchar_t *pszFile,
+    unsigned int nLine,
+    uintptr_t pReserved
+    )
+{
+    /* Fake an exception to call reportfault. */
+    EXCEPTION_RECORD ExceptionRecord;
+    CONTEXT ContextRecord;
+    EXCEPTION_POINTERS ExceptionPointers;
+    BOOL wasDebuggerPresent = FALSE;
+    DWORD ret = 0;
+
+    (pszExpression);
+    (pszFunction);
+    (pszFile);
+    (nLine);
+    (pReserved);
+
+#ifdef _X86_
+
+    __asm {
+        mov dword ptr [ContextRecord.Eax], eax
+        mov dword ptr [ContextRecord.Ecx], ecx
+        mov dword ptr [ContextRecord.Edx], edx
+        mov dword ptr [ContextRecord.Ebx], ebx
+        mov dword ptr [ContextRecord.Esi], esi
+        mov dword ptr [ContextRecord.Edi], edi
+        mov word ptr [ContextRecord.SegSs], ss
+        mov word ptr [ContextRecord.SegCs], cs
+        mov word ptr [ContextRecord.SegDs], ds
+        mov word ptr [ContextRecord.SegEs], es
+        mov word ptr [ContextRecord.SegFs], fs
+        mov word ptr [ContextRecord.SegGs], gs
+        pushfd
+        pop [ContextRecord.EFlags]
+    }
+
+    ContextRecord.ContextFlags = CONTEXT_CONTROL;
+#pragma warning(push)
+#pragma warning(disable:4311)
+    ContextRecord.Eip = (ULONG)_ReturnAddress();
+    ContextRecord.Esp = (ULONG)_AddressOfReturnAddress();
+#pragma warning(pop)
+    ContextRecord.Ebp = *((ULONG *)_AddressOfReturnAddress()-1);
+
+#elif defined (_IA64_) || defined (_AMD64_)
+
+    /* Need to fill up the Context in IA64 and AMD64. */
+    RtlCaptureContext(&ContextRecord);
+
+#else  /* defined (_IA64_) || defined (_AMD64_) */
+
+    ZeroMemory(&ContextRecord, sizeof(ContextRecord));
+
+#endif  /* defined (_IA64_) || defined (_AMD64_) */
+
+    ZeroMemory(&ExceptionRecord, sizeof(ExceptionRecord));
+
+    ExceptionRecord.ExceptionCode = STATUS_INVALID_PARAMETER;
+    ExceptionRecord.ExceptionAddress = _ReturnAddress();
+
+    ExceptionPointers.ExceptionRecord = &ExceptionRecord;
+    ExceptionPointers.ContextRecord = &ContextRecord;
+
+    wasDebuggerPresent = IsDebuggerPresent();
+
+    /* Make sure any filter already in place is deleted. */
+    SetUnhandledExceptionFilter(NULL);
+
+    ret = UnhandledExceptionFilter(&ExceptionPointers);
+
+    // if no handler found and no debugger previously attached
+    // the execution must stop into the debugger hook.
+    if (ret == EXCEPTION_CONTINUE_SEARCH && !wasDebuggerPresent) {
+        _CRT_DEBUGGER_HOOK(_CRT_DEBUGGER_INVALIDPARAMETER);
+    }
+
+    TerminateProcess(GetCurrentProcess(), STATUS_INVALID_PARAMETER);
+}
+```
+
+Modifying it to suit our needs, we get:
+
+```cpp
+#if _MSC_VER >= 1300
+#include <rtcapi.h>
+#endif
+
+#ifndef _AddressOfReturnAddress
+
+// Taken from: http://msdn.microsoft.com/en-us/library/s975zw7k(VS.71).aspx
+#ifdef __cplusplus
+#define EXTERNC extern "C"
+#else
+#define EXTERNC
+#endif
+
+// _ReturnAddress and _AddressOfReturnAddress should be prototyped before use
+EXTERNC void *_AddressOfReturnAddress(void);
+EXTERNC void *_ReturnAddress(void);
+
+#endif
+
+// The following function retrieves exception info
+
+void GetExceptionPointers(DWORD dwExceptionCode,
+                          EXCEPTION_POINTERS **ppExceptionPointers) {
+    // The following code was taken from VC++ 8.0 CRT (invarg.c: line 104)
+
+    EXCEPTION_RECORD ExceptionRecord;
+    CONTEXT ContextRecord;
+    memset(&ContextRecord, 0, sizeof(CONTEXT));
+
+#ifdef _X86_
+
+    __asm {
+        mov dword ptr [ContextRecord.Eax], eax
+            mov dword ptr [ContextRecord.Ecx], ecx
+            mov dword ptr [ContextRecord.Edx], edx
+            mov dword ptr [ContextRecord.Ebx], ebx
+            mov dword ptr [ContextRecord.Esi], esi
+            mov dword ptr [ContextRecord.Edi], edi
+            mov word ptr [ContextRecord.SegSs], ss
+            mov word ptr [ContextRecord.SegCs], cs
+            mov word ptr [ContextRecord.SegDs], ds
+            mov word ptr [ContextRecord.SegEs], es
+            mov word ptr [ContextRecord.SegFs], fs
+            mov word ptr [ContextRecord.SegGs], gs
+            pushfd
+            pop [ContextRecord.EFlags]
+            }
+
+    ContextRecord.ContextFlags = CONTEXT_CONTROL;
+#pragma warning(push)
+#pragma warning(disable : 4311)
+    ContextRecord.Eip = (ULONG)_ReturnAddress();
+    ContextRecord.Esp = (ULONG)_AddressOfReturnAddress();
+#pragma warning(pop)
+    ContextRecord.Ebp = *((ULONG *)_AddressOfReturnAddress() - 1);
+
+#elif defined(_IA64_) || defined(_AMD64_)
+
+    /* Need to fill up the Context in IA64 and AMD64. */
+    RtlCaptureContext(&ContextRecord);
+
+#else /* defined (_IA64_) || defined (_AMD64_) */
+
+    ZeroMemory(&ContextRecord, sizeof(ContextRecord));
+
+#endif /* defined (_IA64_) || defined (_AMD64_) */
+
+    ZeroMemory(&ExceptionRecord, sizeof(EXCEPTION_RECORD));
+
+    ExceptionRecord.ExceptionCode = dwExceptionCode;
+    ExceptionRecord.ExceptionAddress = _ReturnAddress();
+
+    EXCEPTION_RECORD *pExceptionRecord = new EXCEPTION_RECORD;
+    memcpy(pExceptionRecord, &ExceptionRecord, sizeof(EXCEPTION_RECORD));
+    CONTEXT *pContextRecord = new CONTEXT;
+    memcpy(pContextRecord, &ContextRecord, sizeof(CONTEXT));
+
+    *ppExceptionPointers = new EXCEPTION_POINTERS;
+    (*ppExceptionPointers)->ExceptionRecord = pExceptionRecord;
+    (*ppExceptionPointers)->ContextRecord = pContextRecord;
+}
+```
+
+I'm not going to pretend that I inspected the inline assembly on a x86 build of
+Windows, but I do know at least what the function does give me at the end of the
+day: a nicely-filled `EXCEPTION_POINTERS` structure that has the necessary
+context I need. With that, we can go ahead and implement a rudimentary way to
+invoke our exception filter using the `_set_purecall_handler` intrinsic:
+
+```cpp
+typedef void (__cdecl* _purecall_handler)(void);
+static _purecall_handler gOrigPurecallHandler = NULL;
+
+MStatus initializePlugin(MObject obj)
+{
+    // ...
+    gOrigPurecallHandler = _set_purecall_handler([]() {
+      EXCEPTION_POINTERS *ppExceptionPointers = NULL;
+      GetExceptionPointers(EXCEPTION_NONCONTINUABLE, &ppExceptionPointers);
+      mayaCustomVectoredExceptionHandler(ppExceptionPointers);
+      ::TerminateProcess(0);
+    });
+
+    // ...
+    return mstat;
+}
+```
+
+You can see that we store the original handler when we substitute our own lambda
+function with it.
+
+!!! tip Making things easier to debug
+    One thing to note: because CRT exceptions don't really have corresponding
+    Win32 exception codes defined for them, if you just invoke the SEH filter as
+    is, the generated crash dump's error code will just be 0x00000001
+    (`ERROR_INVALID_FUNCTION`), which doesn't really tell us much. It might be
+    worth having a separate exception handler that specifically captures more
+    information about the pure virtual function call-site, or at least letting
+    the developer looking at the crash dump know that they _are_ dealing with a
+    such a situation.
+
+Go ahead and execute the same crash code again, and you should now see your
+exception handler get invoked, and the dump file written out to the custom
+location specified with our own user streams.
+
+Cool! Let's also do the same thing we did with our unhandled exception filter,
+where we preserve the original handler when unloading our plug-in:
+
+```cpp
+MStatus uninitializePlugin(MObject obj)
+{
+// ...
+    _set_purecall_handler(gOrigPurecallHandler);
+// ...
+    return mstat;
+}
+```
+
+Great! We now are able to catch pure virtual function calls. Let's move on.
+
+### Catching ``std::abort`` and other signals ###
+
+By now, we've learned that there are a bunch of exception mechanisms on Windows:
+the Structured Exceptions, and the ones thrown from the C runtime library. We've
+also learned about `_set_purecall_handler`, which sets the handler for
+exceptions thrown for the CRT when it comes to pure virtual function
+calls. However, there is another way that programs can be forced to be
+terminated on Windows, and that is via the use of `std::abort`, which sends the
+`SIGABRT` signal to the program.
+
+!!! note Light the Batsignal...  So what is a signal exactly? It's basically a
+    software-side interrupt that tells the system that "hey, something
+    _exceptional_ has occurred in the execution of this program" and the system
+    will take over to decide what to do from there. The concept comes from UNIX,
+    but is ported over to Windows (although there are exceptions here and there,
+    such as `SIGINT` not being supported due to Win32 generating new threads to
+    handle software-side interrupts), so we can make use of the CRT functions to
+    accomplish our goals here.
+
+So, assuming we want to be able to also invoke our custom crash handler if
+`std::abort` is called in code, what do we do?
+
+```cpp
+typedef void (* abort_handler)(int sig);
+static abort_handler gOrigAbortHandler = NULL;
+
+gOrigAbortHandler = signal(SIGABRT, [](int signal){ (void)signal; ::RaiseException(SIGABRT, EXCEPTION_NONCONTINUABLE, 0, NULL); });
+```
+
+As you can see, the answer is trivially simple when making use of what's
+available in the CRT. However, there's one minor difference between what we're
+doing here and what we did earlier on where we formatted the exception record
+ourselves; here, we just rely on `RaiseException` which will automatically do
+the equivalent of raising a structured exception, which will in turn
+automatically invoke our custom exception filter, giving it the error code of
+`EXCEPTION_NONCONTINUABLE` (which will also show up in the dump file generated.)
+
+You can make use of either method to generate the crash dump with the
+information you want; both work fine in practice.
+
+Don't forget to also re-set the `std::abort` handler after when we uninitialize
+our plug-in:
+
+```cpp
+signal(SIGABRT, gOrigAbortHandler);
+```
+
+!!! tip Catching other UNIX signals?
+    If you're interested, you can also attempt to catch all the other traditional
+    UNIX signals such as `SIGFPE`, `SIGILL`, `SIGTERM` through the same method as
+    well; just swap the parameter that you pass to `signal`.
+
+With that, we've got a pretty good grasp on making a custom crash handler thus
+far. We can now catch most types of exceptions and other crash-y behaviour,
+invoke our exception filter to execute, and write out the data we want.
+
+...Now imagine that someone else has read this tutorial, and both of you deploy
+your plug-ins to the same person. Recall that `SetUnhandledExceptionFilter` sets
+the top-level exception handler for the _entire process and all its threads_.
+
+I'm sure you can see where this is going: how do we stop people from overwriting
+our own exception handler with their own?
+
+## Detouring the CRT's exception handler ##
+
+So, how we're going to do this is make use of a technique called _detouring_,
+where we essentially patch over the original function in process memory to point
+to an empty function. The order of operations looks like this:
+
+1. On load of our plug-in, we call `SetUnhandledExceptionFilter` to set our
+   handler as the top-level handler for the `maya.exe` process.
+
+2. We detour `SetUnhandledExceptionFilter` to an empty function that doesn't do
+   anything, so that any future calls to it by anyone else will not be able to
+   un-set our handler.
+
+3. And, of course, upon unloading our plug-in, we restore the original
+   `SetUnhandledExceptionFilter` function to its original state for everyone
+   else to use as per-normal again.
+
+We've already done part 1. So before we implement Part 2, we need to talk a
+little (again) about the Portable Executable (PE) format that Windows uses for
+the memory layout of executables.
+
+### The Import Address Table (IAT) ###
+
+So, just a quick re-cap: the format that all executables are expected to have on
+Windows is the Portable Executable, or PE format. The PE format itself has a
+very well-defined specification (as expected), and the Windows loader will map
+parts of the file into memory based on where they are in the file itself. One of
+these regions is the **Import Address Table**, which, as the name implies, is
+essentially a lookup table that stores the entries for symbols that are being
+_imported_ from other libraries during the binding process. What essentially
+happens is:
+
+0. During compilation of the program, when the compiler generates the IAT
+   section of the PE executable, it writes the entries for every function that
+   is imported from every implicitly-linked DLL at compile-time into that table
+   as a bunch of function pointers. The entries in the table can either be an
+   address, or an actual function name itself, and how the dynamic linker is
+   supposed to know is based off the fields of each entry in the IAT itself. (If
+   bit 63 is set to `1`, the function is to be imported by ordinal, otherwise
+   there are 31 bits reserved for indexing into _another_ table, known as the
+   Hint/Name Table, that contains the string of the function to be imported.)
+   These tables are stored in the various sections as defined by the PE format.
+
+1. The program to be executed is loaded into the VMAS and mapped into memory by
+   the OS loader.
+
+2. The dynamic linker parses the IAT and as it loads other modules, it patches
+   over the IAT table (known as "fixing up") entries with the addresses to the
+   _actual_ functions in those other modules. (For example,
+   `SetUnhandledExceptionFilter`!).
+
+3. The last entry in the IAT is set to `NULL` to indicate the table's end.
+
+4. Thus, when the entry in the IAT is called upon at runtime, we execute an
+   indirect jump to the fixed-up address specified by the function pointer, thus
+   executing the correct function we wanted in our original source code.
+
+!!! tip More information about the PE format and IAT
+    The
+    [official specification](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#import-address-table)
+    regarding the IAT in the PE format is available on MSDN. Although, quite
+    honestly speaking, the information there is rather terse and you might be
+    better off reading the
+    [Wikipedia article](https://en.wikipedia.org/wiki/Portable_Executable#Import_table)
+    for once.
+
+Cool. So how does any of this relate to what we're trying to accomplish here?
+Well, if we know that `SetUnhandledExceptionFilter` is something that we want to
+prevent other callers from executing (at least not until we've unloaded our
+plug-in), and we know that it's an imported syscall, and we know that the
+address of it is actually set in our executable at runtime...
+
+Can you guess where we're going with this? If it hasn't twigged for you yet,
+just read on and see if that light bulb comes on suddenly for you!
+
+### The Import Directory Table ###
+
+Well, since we know that the function pointer exists "somewhere" in our process'
+memory, let's take a stab at finding it among the table. This is where things
+get a little hairy, because almost all of what we're doing here isn't really
+documented well on MSDN: the best resource I can find on this strangely enough
+comes from
+[a Microsoft article that isn't even well-hosted on their own site anymore.](http://www.delphibasics.info/home/delphibasicsarticles/anin-depthlookintothewin32portableexecutablefileformat-part2).
+While the article there gives a pretty good overview of each section of the PE
+format in its entirety, I'll try to summarize the important bits here regarding
+the IAT and Import Table sections themselves.
+
+We start with the basic `IMAGE_IMPORT_DESCRIPTOR` structure, of which there
+exists one for each imported PE executable (i.e. DLL). Looking directly at the
+code from `winnt.h`:
+
+```cpp
+typedef struct _IMAGE_IMPORT_DESCRIPTOR {
+    union {
+        DWORD   Characteristics;            // 0 for terminating null import descriptor
+        DWORD   OriginalFirstThunk;         // RVA to original unbound IAT (PIMAGE_THUNK_DATA)
+    } DUMMYUNIONNAME;
+    DWORD   TimeDateStamp;                  // 0 if not bound,
+                                            // -1 if bound, and real date\time stamp
+                                            //     in IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT (new BIND)
+                                            // O.W. date/time stamp of DLL bound to (Old BIND)
+
+    DWORD   ForwarderChain;                 // -1 if no forwarders
+    DWORD   Name;
+    DWORD   FirstThunk;                     // RVA to IAT (if bound this IAT has actual addresses)
+} IMAGE_IMPORT_DESCRIPTOR;
+typedef IMAGE_IMPORT_DESCRIPTOR UNALIGNED *PIMAGE_IMPORT_DESCRIPTOR;
+```
+
+The structure above describes what is known as the [Import Directory Table](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#import-directory-table),
+where it contains the information to the **Import Address Table** in the member
+called `FirstThunk`. (Ignore the `OriginalFirstThunk` section, which points to
+the **Import Name Table** instead. Yes, yes, legacy/historical conventions and
+all that.) The `FirstThunk` member stores what is known as the **relative
+virtual address** to the IAT that we were previously talking about.
+
+### Relative Virtual Addressing (RVA) ###
+
+If you're not familiar with this term (or haven't read my [previous
+tutorial](https://sonictk.github.io/asm_tutorial/#hello,worldrevisted/breakingthecodedown/rip-relativeaddressing)
+talking about `rip`-relative addressing), basically, on modern x64
+architecture, the OS no longer loads programs at fixed memory addresses;
+the entire memory space of an executable is mapped to virtual memory
+addresses by the **Virtual Memory Address System**, which means that we can
+no longer compile code with **fixed displacements** (i.e. fixed memory
+addresses to locations within the executable's address space.) This gets
+even more complicated with DLLs, since they can load just about anywhere
+within the host process's address space based on the VMAS's
+disposition.
+
+Therefore, RVA was introduced: it basically allows us to specify _offsets_
+within the executable to find memory locations, thus sidestepping the
+problem of not having a guaranteed load address of the start of the
+executable. In practice at runtime, this turns out to be not so bad in terms
+of a performance hit, since part of the loader's job is to fix-up all the
+relative addresses upon loading the executable and patch them over with the
+"real" addresses (the reason _real_ is in quotes is because the final
+addresses are still technically virtual addresses that will get translated
+by the VMAS to the still-not-real-but-more-real physical addresses that
+point to the actual RAM)
+
+An example of RVA is the following:
+
+**********************************************************
+*     load address                     RVA               *
+*  +-----------------+              +-----------------+  *
+*  | 0x20000000      |              |  0x00000004     |  *
+*  +-------+---------+              +---------+-------+  *
+*          |                                  |          *
+*           '--------------. .---------------'           *
+*                           |                            *
+*                  +--------v---------+                  *
+*                  |  0x20000004      |                  *
+*                  +------------------+                  *
+*                    final address                       *
+*                                                        *
+**********************************************************
+[Figure [diagram]: How a relative virtual address (RVA) is constructed.]
+
+As you can see, the concept itself is trivially simple.
+
+### Memory layout of the IAT ###
+
+So that now we understand that the Import Directory Table contains the entries
+for each DLL (PE) imported into our process, we can focus our attention on the
+Import Address Table itself. Each entry in the IAT mimics the following
+structure, again from `winnt.h`:
+
+```cpp
+typedef struct _IMAGE_THUNK_DATA64 {
+    union {
+        ULONGLONG ForwarderString;  // PBYTE
+        ULONGLONG Function;         // PDWORD
+        ULONGLONG Ordinal;
+        ULONGLONG AddressOfData;    // PIMAGE_IMPORT_BY_NAME
+    } u1;
+} IMAGE_THUNK_DATA64;
+typedef IMAGE_THUNK_DATA64 * PIMAGE_THUNK_DATA64;
+
+#define IMAGE_ORDINAL_FLAG64 0x8000000000000000
+#define IMAGE_ORDINAL_FLAG32 0x80000000
+#define IMAGE_ORDINAL64(Ordinal) (Ordinal & 0xffff)
+#define IMAGE_ORDINAL32(Ordinal) (Ordinal & 0xffff)
+#define IMAGE_SNAP_BY_ORDINAL64(Ordinal) ((Ordinal & IMAGE_ORDINAL_FLAG64) != 0)
+#define IMAGE_SNAP_BY_ORDINAL32(Ordinal) ((Ordinal & IMAGE_ORDINAL_FLAG32) != 0)
+```
+
+!!! note x86/x64 differences
+    If you look in `winnt.h` yourself, you'll no doubt notice the presence of
+    the `IMAGE_THUNK_DATA32` struct definition as well; which was used during
+    the days of x86 architecture. The sizes are different and the bitmasks are
+    slightly different as well, but otherwise their purposes are the same.
+
+If you were paying attention in the earlier section, you can see here that this
+structure should start to make some sense: we have the `ForwarderString` member,
+which `IMAGE_ORDINAL_FLAG64` acts as the bitflag to determine if the import is
+imported by ordinal or name. The `Function` member points to the address of the
+function being imported itself, which is what we'll be primarily interested in,
+while the `Ordinal` and `AddressOfData` members correspond to the **Ordinal Number** and the
+[Hint/Name Table RVA](https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#hintname-table)
+respectively as detailed in the MSDN documentation.
+
+Overall, if the above was a little confusing, you can think of the relationships
+between the Import Directory Tables and IATs along with how they relate to the
+DLLs being imported in the following manner:
+
+*******************************************************
+*                                                     *
+*     main.exe                                        *
+*  +---------------------------------------------+    *
+*  |///////// Other stuff ///////////////////////|    *
+*  |/////////////////////////////////////////////|    *
+*  +---------------------------------------------+    *
+*  | Import directory table                      |    *
+*  |   `IMAGE_IMPORT_DESCRIPTOR` for `foo.dll`   |    *
+*  +---------------------------------------------+    *
+*  | Import address table                        |    *
+*  | +----------------------------------------+  |    *
+*  | |    `IMAGE_THUNK_DATA`                  |  |    *
+*  | |        for `bar()`                     |  |    *
+*  | +----------------------------------------+  |    *
+*  | |    `IMAGE_THUNK_DATA`                  |  |    *
+*  | |        for `bazz()`                    |  |    *
+*  | +----------------------------------------+  |    *
+*  | |    `IMAGE_THUNK_DATA`                  |  |    *
+*  | |        for `jazz()`                    |  |    *
+*  | +----------------------------------------+  |    *
+*  | |0000000000000000000000000000000000000000|  |    *
+*  | |00000000 End of table (null) 00000000000|  |    *
+*  | |0000000000000000000000000000000000000000|  |    *
+*  | |0000000000000000000000000000000000000000|  |    *
+*  | +----------------------------------------+  |    *
+*  +---------------------------------------------+    *
+*  |    foo.dll                                  |    *
+*  |   +--------------------------------------+  |    *
+*  |   |   Export Address Table               |  |    *
+*  |   |                                      |  |    *
+*  |   +--------------------------------------+  |    *
+*  |   |    Export bar()                      |  |    *
+*  |   |                                      |  |    *
+*  |   +--------------------------------------+  |    *
+*  |   |    Export bazz()                     |  |    *
+*  |   |                                      |  |    *
+*  |   +--------------------------------------+  |    *
+*  |   |    Export jazz()                     |  |    *
+*  |   |                                      |  |    *
+*  |   +--------------------------------------+  |    *
+*  +---------------------------------------------+    *
+*                                                     *
+*******************************************************
+[Figure [diagram]: A _very_ rough overview of how the IAT works.]
+
+We see that `foo.dll` exports `bar`, `bazz` and `jazz`, which creates a seperate
+**Export Address Table** containing the addresses and data about those functions
+for the dynamic linker to use when patching over the addresses in our IAT within
+`main.exe` (This is what happens what you use `__declspec(export)`, for example,
+to tell the compiler to generate those entries in the EAT). We also see that
+there is one entry in the Import Directory Table for `foo.dll` being imported,
+and that there are 3 IAT entries, one for each function being imported from
+`foo.dll`.
+
+So hopefully that makes more sense now; it really isn't that complicated, but
+I'll be the first to admit that gathering information about this topic was a
+little annoying and hard to piece together. Now that we have that sorted out,
+let's actually start writing the code to walk the IAT(s) and find all instances
+of `SetUnhandledExceptionFilter`.
+
+Have you caught on to what we're planning to do yet? If you haven't, here's the
+answer: because we know now where the import entries are stored in our
+executable `maya.exe` (and for that matter, _any_ other DLLs loaded within Maya
+itself), we can walk all of them, _fix up the addresses to
+`SetUnhandledExceptionFilter` in all of them_ to point to an empty function that
+does nothing, and from that point on, while other callers may be able to call
+`SetUnhandledExceptionFilter`, they won't be able to actually _do_ anything with
+it!
+
+!!! warning There be dragons where we're going...
+    While I'll be talking about this later, this is explicitly _not_ recommended
+    by [Raymond Chen](https://devblogs.microsoft.com/oldnewthing/20180606-00/?p=98925) himself,
+    for good reason. However, for the reasons already discussed above regarding
+    WER, we're going to move on ahead for now until Microsoft offers some better
+    exposed functionality from WER and abandons their "online-only" philosophy
+    of error reporting.
+
+Now that we know what we're going to be implementing next, let's go ahead and
+start the first part of this process: finding all instances of where
+`SetUnhandledExceptionFilter` might be lurking within the IATs of the DLLs
+loaded within Maya.
+
+### Searching the IAT ###
+
+Let's start with what exactly we're looking to do: we want to replace the
+default `SetUnhandledExceptionFilter` with our own detoured function that does
+nothing. Let's start by writing the detoured function first, which effectively
+amounts to a no-op:
+
+```cpp
+LONG WINAPI detouredSetUnhandledExceptionFilter(LPEXCEPTION_POINTERS exceptionInfo)
+{
+    (void)exceptionInfo;
+    return 0;
+}
+```
+
+In order to start walking the Import Directory Table for the process and all its
+loaded modules, we basically need to write some Win32 code:
+
+```cpp
+bool patchOverUnhandledExceptionFilter(PROC pFnFilterReplace, FARPROC *pOrigFilter)
+{
+    HMODULE hKernel32Mod = NULL;
+    ::GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "kernel32.dll", &hKernel32Mod);
+    if (hKernel32Mod == NULL) {
+        return false;
+    }
+    if (*pOrigFilter == NULL) {
+        *pOrigFilter = ::GetProcAddress(hKernel32Mod, "SetUnhandledExceptionFilter");
+        if (*pOrigFilter == NULL) {
+            return false;
+        }
+    }
+
+    DWORD currentProcId = ::GetCurrentProcessId();
+    HANDLE hProcSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, currentProcId);
+    MODULEENTRY32 modEntry = {0};
+    modEntry.dwSize = sizeof(modEntry);
+
+    for (BOOL bStat = Module32First(hProcSnapshot, &modEntry); bStat == TRUE; bStat = Module32Next(hProcSnapshot, &modEntry)) {
+        // TODO: Gotta patch over here...
+    }
+}
+```
+
+Ok, let's break this down a little bit:
+
+```cpp
+    HMODULE hKernel32Mod = NULL;
+    ::GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "kernel32.dll", &hKernel32Mod);
+    if (hKernel32Mod == NULL) {
+        return false;
+    }
+    if (*pOrigFilter == NULL) {
+        *pOrigFilter = ::GetProcAddress(hKernel32Mod, "SetUnhandledExceptionFilter");
+        if (*pOrigFilter == NULL) {
+            return false;
+        }
+    }
+```
+
+This is pretty obvious; we're getting a handle to `kernel32.dll`, which
+`SetUnhandledExceptionFilter` resides in, and then getting the address of the
+function itself by name.
+
+```cpp
+    DWORD currentProcId = ::GetCurrentProcessId();
+    HANDLE hProcSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, currentProcId);
+    MODULEENTRY32 modEntry = {0};
+    modEntry.dwSize = sizeof(modEntry);
+```
+
+This part is a little more complex, but if we look at the documentation of
+`CreateToolhelp32Snapshot`, things start to make more sense: we are basically
+snapshotting the entire process and all the modules currently being used so that
+we can walk over it without fear of DLLs being unloaded in the middle of our
+walk (possible, if other threads are executing at the same time).
+
+!!! tip Why not `EnumProcessModules`?
+    We could also use `EnumProcessModules` to achieve the same thing. However,
+    there's a bunch of additional memory management involved, and since
+    `CreateToolhelp32Snapshot` manages that for us (since this patch operation
+    isn't particularly expensive), I'm electing to use that for simplicity and
+    safety (since I also don't know if `EnumProcessModules` executes in an
+    atomic fashion).
+
+Once we have the snapshot of process memory, we can begin walking it, as the for
+loop demonstrates:
+
+```cpp
+    for (BOOL bStat = Module32First(hProcSnapshot, &modEntry); bStat == TRUE; bStat = Module32Next(hProcSnapshot, &modEntry)) {
+        // TODO: Gotta patch over here...
+    }
+```
+
+As you can see, we make use of the Win32 utility functions `Module32First` and
+`Module32Next` to iterate over the loaded modules within the memory snapshot
+that we just took. Now we just need to actually write the code within the loop
+to find our desired function...
+
+To do that, let's abstract a little bit here and have a single function
+responsible for patching over a single IAT entry that we can continue calling
+for each IAT entry:
+
+```cpp
+bool patchOverIATEntryInOneModule(const char *calleeModName, PROC pfnCurrent, PROC pfnNew, HMODULE hmodCaller)
+{
+    ULONG importSectionSize = 0;
+    PIMAGE_IMPORT_DESCRIPTOR pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)::ImageDirectoryEntryToDataEx(hmodCaller, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &importSectionSize, NULL);
+    if (pImportDesc == NULL) {
+        return false;
+    }
+
+    bool foundEntry = false;
+    while (pImportDesc->Name != NULL && pImportDesc->Characteristics != NULL) {
+        PSTR pszImportName = (PSTR)((PBYTE)hmodCaller + pImportDesc->Name);
+        if (_stricmp(pszImportName, calleeModName) == 0) {
+            foundEntry = true;
+            break;
+        }
+        ++pImportDesc;
+    }
+    if (foundEntry != true) {
+        return false;
+    }
+
+    PIMAGE_THUNK_DATA pThunk = (PIMAGE_THUNK_DATA)((PBYTE)hmodCaller + pImportDesc->FirstThunk);
+    while (pThunk->u1.Function != NULL) {
+        PROC *pFunc = (PROC *)&pThunk->u1.Function;
+
+        if (*pFunc == *pfnCurrent) {
+            // TODO: Found! ...Now how do we patch over it?
+
+            return true;
+        }
+        ++pThunk;
+    }
+
+    return false;
+}
+```
+
+Again, let's break this down bit-by-bit:
+
+```cpp
+    ULONG importSectionSize = 0;
+    PIMAGE_IMPORT_DESCRIPTOR pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)::ImageDirectoryEntryToDataEx(hmodCaller, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &importSectionSize, NULL);
+    if (pImportDesc == NULL) {
+        return false;
+    }
+```
+As mentioned earlier, the Import Directory Table takes the form of the
+`IMAGE_IMPORT_DESCRIPTOR` structure, and we make use of the Win32 function
+`ImageDirectoryEntryToDataEx` to get the address of that section within our
+current module being iterated over, by specifying the
+`IMAGE_DIRECTORY_ENTRY_IMPORT` parameter.
+
+```cpp
+    bool foundEntry = false;
+    while (pImportDesc->Name != NULL && pImportDesc->Characteristics != NULL) {
+        PSTR pszImportName = (PSTR)((PBYTE)hmodCaller + pImportDesc->Name);
+        if (_stricmp(pszImportName, calleeModName) == 0) {
+            foundEntry = true;
+            break;
+        }
+        ++pImportDesc;
+    }
+```
+
+This code here is essentially checking if the Import Directory Table's name
+entry matches that of what we're looking for, which is this case is
+`kernel32.dll`. The reason for the expression `(PSTR)((PBYTE)hmodCaller +
+pImportDesc->Name)` is that if you recall, the member `Name` within the
+`IMAGE_IMPORT_DESCRIPTOR` is not the _actual_ name itself, it's an RVA yet again
+to the ASCII string within the executable where the string data is actually
+stored; therefore, to get the proper pointer to that string, we offset from the
+start of the image base and add the amount that `Name` specifies.
+
+Next, once we've located the Import Directory Table that we're interested in, we
+have to walk the IAT entries within it to find the function that we're looking
+for:
+
+```cpp
+    PIMAGE_THUNK_DATA pThunk = (PIMAGE_THUNK_DATA)((PBYTE)hmodCaller + pImportDesc->FirstThunk);
+    while (pThunk->u1.Function != NULL) {
+        PROC *pFunc = (PROC *)&pThunk->u1.Function;
+
+        if (*pFunc == *pfnCurrent) {
+            // TODO: Found! ...Now how do we patch over it?
+
+            return true;
+        }
+        ++pThunk;
+    }
+```
+
+Recall again that each IAT entry is represented by the struct `IMAGE_THUNK_DATA`
+(with slightly different sizes for x86/x64 architecture), and that the
+`FirstThunk` member within the Import Directory Table is actually the RVA to the
+beginning of the IAT. Thus, we can again offset starting from the image base to
+find the address of the IAT entry, cast that to a pointer to a
+`IMAGE_THUNK_DATA`, and then start checking within it for the `Function` member,
+which points to the address of the function it is importing. We then check if it
+matches the function we're looking for (i.e. `SetUnhandledExceptionFilter`), and
+if it is...
+
+Well, now what? We need to somehow replace that address with the address of our
+detoured function, but how do we go about overwriting this bit of process memory
+without triggering an access violation?
+
+### Overwriting process memory ###
+
+When Windows deals with memory, it doesn't just allocate or de-allocate memory
+in terms of bytes or bits, it does so in _pages_: larger blocks of memory that
+the VMAS uses in memory management. This is the smallest unit of data that is
+usually used when the VMAS allocates/de-allocates memory for use by
+applications, and
+[each page has its own read/write/execute permissions](https://docs.microsoft.com/en-us/windows/win32/memory/memory-protection)
+for making sure that rogue processes don't go about crashing other processes on
+the same machine. However, by that same vein, it also provides us the necessary
+syscalls to be able to modify those protections.
+
+Thus, we can write the following code:
+
+```cpp
+MEMORY_BASIC_INFORMATION memDesc = {0};
+::VirtualQuery(pFunc, &memDesc, sizeof(MEMORY_BASIC_INFORMATION));
+if (!::VirtualProtect(memDesc.BaseAddress, memDesc.RegionSize, PAGE_READWRITE, &memDesc.Protect)) {
+    return false;
+}
+
+HANDLE hProcess = GetCurrentProcess();
+::WriteProcessMemory(hProcess, pFunc, &pfnNew, sizeof(pfnNew), NULL);
+
+DWORD dwOldProtect = 0;
+::VirtualProtect(memDesc.BaseAddress, memDesc.RegionSize, memDesc.Protect, &dwOldProtect);
+return true;
+```
+
+Voila! We basically get the information about the page where the function in
+question is currently located, disable the page protections on it to allow us to
+write to it, write to it using `WriteProcessMemory`, and then restore the
+original page protections after without anyone else being the wiser.
+
+With a bit of abstraction, our final code for patching over looks like this:
+
+```cpp
+bool patchOverIATEntryInOneModule(const char *calleeModName, PROC pfnCurrent, PROC pfnNew, HMODULE hmodCaller)
+{
+    ULONG importSectionSize = 0;
+    PIMAGE_IMPORT_DESCRIPTOR pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)::ImageDirectoryEntryToDataEx(hmodCaller, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &importSectionSize, NULL);
+    if (pImportDesc == NULL) {
+        return false;
+    }
+
+    bool foundEntry = false;
+    while (pImportDesc->Name != NULL && pImportDesc->Characteristics != NULL) {
+        PSTR pszImportName = (PSTR)((PBYTE)hmodCaller + pImportDesc->Name);
+        if (_stricmp(pszImportName, calleeModName) == 0) {
+            foundEntry = true;
+            break;
+        }
+        ++pImportDesc;
+    }
+    if (foundEntry != true) {
+        return false;
+    }
+
+    PIMAGE_THUNK_DATA pThunk = (PIMAGE_THUNK_DATA)((PBYTE)hmodCaller + pImportDesc->FirstThunk);
+    while (pThunk->u1.Function != NULL) {
+        PROC *pFunc = (PROC *)&pThunk->u1.Function;
+
+        if (*pFunc == *pfnCurrent) { // NOTE: (sonictk) Found! Now we can patch over it.
+            MEMORY_BASIC_INFORMATION memDesc = {0};
+            ::VirtualQuery(pFunc, &memDesc, sizeof(MEMORY_BASIC_INFORMATION));
+            if (!::VirtualProtect(memDesc.BaseAddress, memDesc.RegionSize, PAGE_READWRITE, &memDesc.Protect)) {
+                return false;
+            }
+
+            HANDLE hProcess = GetCurrentProcess();
+            ::WriteProcessMemory(hProcess, pFunc, &pfnNew, sizeof(pfnNew), NULL);
+
+            DWORD dwOldProtect = 0;
+            ::VirtualProtect(memDesc.BaseAddress, memDesc.RegionSize, memDesc.Protect, &dwOldProtect);
+            return true;
+        }
+        ++pThunk;
+    }
+
+    return false;
+}
+
+
+bool patchOverIATEntriesInAllModules(const char *calleeModName, PROC pfnCurrent, PROC pfnNew)
+{
+    DWORD currentProcId = ::GetCurrentProcessId();
+    HANDLE hProcSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, currentProcId);
+
+    MODULEENTRY32 modEntry = {0};
+    modEntry.dwSize = sizeof(modEntry);
+
+    for (BOOL bStat = Module32First(hProcSnapshot, &modEntry); bStat == TRUE; bStat = Module32Next(hProcSnapshot, &modEntry)) {
+        patchOverIATEntryInOneModule(calleeModName, pfnCurrent, pfnNew, modEntry.hModule);
+    }
+
+    ::CloseHandle(hProcSnapshot);
+
+    return true;
+}
+
+
+bool patchOverUnhandledExceptionFilter(PROC pFnFilterReplace, FARPROC *pOrigFilter)
+{
+    HMODULE hKernel32Mod = NULL;
+    ::GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "kernel32.dll", &hKernel32Mod);
+    if (hKernel32Mod == NULL) {
+        return false;
+    }
+    if (*pOrigFilter == NULL) {
+        *pOrigFilter = ::GetProcAddress(hKernel32Mod, "SetUnhandledExceptionFilter");
+        if (*pOrigFilter == NULL) {
+            return false;
+        }
+    }
+
+    bool bStat = patchOverIATEntriesInAllModules("kernel32.dll", *pOrigFilter, pFnFilterReplace);
+    return bStat;
+}
+```
+
+Go ahead and call `patchOverUnhandledExceptionFilter` in `initializePlugin`
+after you've already set the new top-level exception handler to our custom one,
+then try setting `SetUnhandledExceptionFilter` after, whether in the plug-in or
+in another one after. You'll find that it ends up calling the
+`detouredSetUnhandledExceptionFilter` function instead, and our original handler
+still runs on any of our Maya crashes!
+
+
+# Parsing our dump #
+
+So now we have a pretty good setup for capturing our dumps, and we're able to
+stop other "bad" actors from removing our crash handler once we have it
+loaded. However, right now, we only write the scene file name into the dump; we
+could do a lot more here to help ourselves in the event of a Maya crash. Let's
+go ahead and try to add more information about the environment context at the
+time of a crash now.
+
+## Adding a _more_ customized user stream ##
+
+The first thing we want to do is make sure we decide on what exactly we're going
+to store in memory, and what we will write to the dump file in the event of a
+crash. For now, I'm deciding on the following for our example:
+
+1. The last DAG parent touched in the scene
+2. The last DAG child touched in the scene
+3. The last DG node added to the scene
+4. The last DAG operation type
+5. The Maya API version
+6. Any custom API version (for custom Maya builds, which is common in studios
+   that have a working relationship with Autodesk)
+7. The version of Maya that was used to create the Maya scene file open
+8. And whether the Y-axis is determined as the global "up" axis
+
+Which translates nicely to the following struct:
+
+```cpp
+#define MAYA_DAG_PATH_MAX_NAME_LEN 512
+#define MAYA_DG_NODE_MAX_NAME_LEN 512
+
+#pragma pack(1)
+typedef struct MayaCrashDumpInfo
+{
+    char lastDagParentName[MAYA_DAG_PATH_MAX_NAME_LEN];
+    char lastDagChildName[MAYA_DAG_PATH_MAX_NAME_LEN];
+    char lastDGNodeAddedName[MAYA_DG_NODE_MAX_NAME_LEN];
+    int verAPI;
+    int verCustom;
+    int verMayaFile;
+    short lastDagMessage;
+    bool isYUp;
+} MayaCrashDumpInfo;
+```
+
+We pack this struct manually, because this is the _actual_ data that's going to
+be written inside the dump file, and if we want to be able to parse it, we need
+to make sure that we don't get any funny padding surprises from the compiler.
+
+Storing this data within the Maya session as the user interacts and works is a
+simple exercise in the Maya API, and really shouldn't require any explanation:
+
+```cpp
+static MayaCrashDumpInfo gMayaCrashDumpInfo = {0};
+
+void mayaSceneAfterOpenCB(void *unused)
+{
+    (void)unused;
+
+    memset(&gMayaCrashDumpInfo, 0, sizeof(gMayaCrashDumpInfo));
+    gMayaCrashDumpInfo.verAPI = MGlobal::apiVersion();
+    gMayaCrashDumpInfo.verCustom = MGlobal::customVersion();
+    gMayaCrashDumpInfo.verMayaFile = MFileIO::latestMayaFileVersion();
+    gMayaCrashDumpInfo.isYUp = MGlobal::isYAxisUp();
+
+    return;
+}
+
+
+void mayaAllDAGChangesCB(MDagMessage::DagMessage msgType, MDagPath &child, MDagPath &parent, void *unused)
+{
+    (void)unused;
+    gMayaCrashDumpInfo.lastDagMessage = (short)msgType;
+    MString childName = child.partialPathName();
+    const char *childNameC = childName.asChar();
+    size_t lenChildName = strlen(childNameC);
+    lenChildName = lenChildName > MAYA_DAG_PATH_MAX_NAME_LEN ? MAYA_DAG_PATH_MAX_NAME_LEN : lenChildName;
+
+    MString parentName = parent.partialPathName();
+    const char *parentNameC = parentName.asChar();
+    size_t lenParentName = strlen(parentNameC);
+    lenParentName = lenParentName > MAYA_DAG_PATH_MAX_NAME_LEN ? MAYA_DAG_PATH_MAX_NAME_LEN : lenParentName;
+
+    memcpy(gMayaCrashDumpInfo.lastDagChildName, childNameC, lenChildName);
+    memset(gMayaCrashDumpInfo.lastDagChildName + lenChildName, 0, 1);
+
+    memcpy(gMayaCrashDumpInfo.lastDagParentName, parentNameC, lenParentName);
+    memset(gMayaCrashDumpInfo.lastDagParentName + lenParentName, 0, 1);
+
+    return;
+}
+
+
+void mayaNodeAddedCB(MObject &node, void *unused)
+{
+    (void)unused;
+
+    if (!node.hasFn(MFn::kDependencyNode)) {
+        return;
+    }
+
+    MStatus mstat;
+    MFnDependencyNode fnNode(node, &mstat);
+    if (mstat != MStatus::kSuccess) {
+        return;
+    }
+    MString nodeName;
+    if (!fnNode.hasUniqueName()) {
+        nodeName = fnNode.absoluteName(&mstat);
+        if (mstat != MStatus::kSuccess) {
+            return;
+        }
+    } else {
+        nodeName = fnNode.name(&mstat);
+    }
+
+    const char *nodeNameC = nodeName.asChar();
+    size_t lenNodeName = strlen(nodeNameC);
+    if (lenNodeName == 0) {
+        return;
+    }
+    memcpy(gMayaCrashDumpInfo.lastDGNodeAddedName, nodeNameC, lenNodeName);
+    memset(gMayaCrashDumpInfo.lastDGNodeAddedName + lenNodeName, 0, 1);
+
+    return;
+}
+```
+
+After that, it's just a matter of registering the callbacks when the plug-in is
+initialized and removing them when the plug-in gets unloaded:
+
+```cpp
+static MCallbackId gMayaSceneAfterOpen_cbid = 0;
+static MCallbackId gMayaAllDAGChanges_cbid = 0;
+static MCallbackId gMayaNodeAdded_cbid = 0;
+
+
+MStatus initializePlugin(MObject obj)
+{
+    //...
+    gMayaSceneAfterOpen_cbid = MSceneMessage::addCallback(MSceneMessage::kAfterOpen, mayaSceneAfterOpenCB, NULL, &mstat);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    gMayaAllDAGChanges_cbid = MDagMessage::addAllDagChangesCallback(mayaAllDAGChangesCB, NULL, &mstat);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    gMayaNodeAdded_cbid = MDGMessage::addNodeAddedCallback(mayaNodeAddedCB, "dependNode", NULL, &mstat);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+    //...
+}
+
+MStatus uninitializePlugin(MObject obj)
+{
+    // ...
+
+    MStatus mstat = MMessage::removeCallback(gMayaSceneAfterOpen_cbid);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    mstat = MMessage::removeCallback(gMayaAllDAGChanges_cbid);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    mstat = MMessage::removeCallback(gMayaNodeAdded_cbid);
+    CHECK_MSTATUS_AND_RETURN_IT(mstat);
+
+    // ...
+}
+```
+
+Again, very trivial. So now we have a struct that's filled with all the good
+information we want in our dump file during a crash. Let's take a look again at
+the code for our crash handler to see how we can write that into the dump. If
+you recall in the earlier Section Custom user streams, we had the following
+structures to deal with when writing out our scene file name into the minidump:
+
+```cpp
+LONG WINAPI mayaCustomUnhandledExceptionFilter(LPEXCEPTION_POINTERS exceptionInfo)
+{
+    // ...
+
+    MINIDUMP_EXCEPTION_INFORMATION dumpExceptionInfo = {0};
+    dumpExceptionInfo.ThreadId = ::GetCurrentThreadId();
+    dumpExceptionInfo.ExceptionPointers = exceptionInfo;
+    dumpExceptionInfo.ClientPointers = TRUE;
+
+    MINIDUMP_USER_STREAM dumpMayaFileInfo = {0};
+    dumpMayaFileInfo.Type = CommentStreamA;
+    dumpMayaFileInfo.BufferSize = MAX_PATH;
+    dumpMayaFileInfo.Buffer = gMayaCurrentScenePath;
+
+    MINIDUMP_USER_STREAM streams[] = {
+        dumpMayaFileInfo,
+    };
+    MINIDUMP_USER_STREAM_INFORMATION dumpUserInfo = {0};
+    dumpUserInfo.UserStreamCount = ARRAY_SIZE(streams);
+    dumpUserInfo.UserStreamArray = streams;
+
+    //...
+```
+
+Now that we have a `MayaCrashDumpInfo` structure of our very own, we can go
+ahead and make a new user stream for it:
+
+```cpp
+#define MAYA_CRASH_INFO_STREAM_TYPE LastReservedStream + 1
+
+    MINIDUMP_USER_STREAM dumpMayaCrashInfo = {0};
+    dumpMayaCrashInfo.Type = MAYA_CRASH_INFO_STREAM_TYPE;
+    dumpMayaCrashInfo.BufferSize = sizeof(gMayaCrashDumpInfo);
+    dumpMayaCrashInfo.Buffer = &gMayaCrashDumpInfo;
+```
+
+If you're wondering what `LastReservedStream` is, it's the [enum defined](https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ne-minidumpapiset-minidump_stream_type)
+for user streams to indicate that any stream types after that will be ignored by
+the debuggers and allows us to store whatever custom types of user streams we
+want in the minidump. Perfect! We can now add this new user stream to the dump
+that we're writing out, like so:
+
+```cpp
+    //...
+
+    MINIDUMP_USER_STREAM streams[] = {
+        dumpMayaFileInfo,
+        dumpMayaCrashInfo
+    };
+
+    //...
+```
+
+And that's it! We can add as many or as few streams as we'd like to the dump
+this way, but generally I prefer keeping all of the information that I need
+specifically in one giant blob struct (for fixed-size buffers) so that it's
+faster to both write and access. Depending on your needs, you can utilize
+different strategies here for writing out your own custom information into the
+minidumps, espeically if you have a lot of variable-sized buffers to store.
+
+!!! tip More examples
+    The code in the repository accompanying this tutorial shows additional
+    examples of storing different types of Maya context information in the
+    minidump, including the scene timing information along with the last MEL
+    procedure executed (which is _especially_ useful for debugging 3rd-party
+    plug-in crashes). I would recommend you try to analyze the use cases for
+    your own pipeline and decide on what you need to store in the minidump.
+
+Ok, now that we have our own custom information in the dump in a custom memory
+layout, if you try to open the dump up in WinDbg now, you'll likely notice that
+we still don't see anything indicating its presence, let alone being able to
+read from it and get the information we desire. Obviously, WinDbg knows nothing
+about our custom user stream now, nor how to represent it to us, and certainly
+we'd like to know about it (otherwise, what would the entire point of
+this tutorial be?).
+
+So, how do we get human-readable information about our structure within the
+minidump? Let's first take a simpler approach to doing this outside of WinDbg,
+and just write a small little command-line program to parse the minidump file,
+read the user stream, and print out information about it.
+
+## Extracting our custom user stream ##
+
+Windows helpfully provides a function, `MiniDumpReadDumpStream`, that will do
+all the heavy lifting and give us the binary data within the user stream that
+we're interested in:
+
+```cpp
+#include <Windows.h>
+#include <Dbghelp.h>
+
+#include "common.h"
+
+#include <stdio.h>
+
+
+void parseAndPrintCustomStreamFromMiniDump(const char *dumpFilePath)
+{
+    if (dumpFilePath == NULL) {
+        return;
+    }
+
+    HANDLE hFile = CreateFile(dumpFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("ERROR: Could not open the dump file requested.\n");
+        return;
+    }
+
+    HANDLE hMapFile = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (hMapFile == NULL) {
+        printf("ERROR: Could not create the file mapping for the dump.\n");
+        return;
+    }
+
+    PVOID pFileView = MapViewOfFile(hMapFile, FILE_MAP_READ, 0, 0, 0);
+    if (pFileView == NULL) {
+        printf("ERROR: Failed to map view of the dump file.\n");
+        return;
+    }
+
+    PMINIDUMP_DIRECTORY miniDumpDirPath = NULL;
+    PVOID pUserStream = NULL;
+    ULONG streamSize = 0;
+    BOOL bStat = MiniDumpReadDumpStream(pFileView,
+                                        MAYA_CRASH_INFO_STREAM_TYPE,
+                                        &miniDumpDirPath,
+                                        &pUserStream,
+                                        &streamSize);
+    if (bStat != TRUE) {
+        printf("ERROR: Failed to find stream in dump file. Check if it was generated correctly.\n");
+        return;
+    }
+
+    if (streamSize != sizeof(MayaCrashDumpInfo)) {
+        printf("ERROR: Stream size mismatch. Check if the dump file was written correctly.\n");
+        return;
+    }
+
+    MayaCrashDumpInfo *dumpInfo = (MayaCrashDumpInfo *)pUserStream;
+    printf("Maya API version: %d\n"
+           "Custom API version: %d\n"
+           "Maya file version: %d\n"
+           "Y is up: %d\n"
+           "Last DAG parent: %s\n"
+           "Last DAG child: %s\n"
+           "Last DAG message: %d\n"
+           "Last DG node added: %s\n"
+           "End of crash info.\n",
+           dumpInfo->verAPI,
+           dumpInfo->verCustom,
+           dumpInfo->verMayaFile,
+           dumpInfo->isYUp,
+           dumpInfo->lastDagParentName,
+           dumpInfo->lastDagChildName,
+           dumpInfo->lastDagMessage,
+           dumpInfo->lastDGNodeAddedName);
+
+    return;
+}
+```
+
+Again, this code should be pretty trivial for anyone who has done a modicum of
+Win32 programming: we create a file handle to the dump file, create a file
+mapping of the file (since that's what the minidump functions generally expect),
+and pass it to `MiniDumpReadDumpStream` with our custom dump stream type
+`MAYA_CRASH_INFO_STEAM_TYPE` as the parameter for `StreamNumber`, cast the
+result to a pointer to a `MayaCrashDumpInfo` structure, and then just print out
+the information within it.
+
+Now all we need is just the entry point, which really is just reading the dump
+file and passing that to `parseAndPrintCustomStreamFromMiniDump`:
+
+```cpp
+int main(int argc, char *argv[])
+{
+    if (argc == 1) {
+        char tempDirPath[MAX_PATH] = {0};
+        DWORD lenTempDirPath = GetEnvironmentVariable((LPCTSTR)TEMP_ENV_VAR_NAME, (LPTSTR)tempDirPath, (DWORD)MAX_PATH);
+        if (lenTempDirPath == 0) {
+            const size_t lenDefaultTempDirPath = strlen(DEFAULT_TEMP_DIRECTORY);
+            memcpy(tempDirPath, DEFAULT_TEMP_DIRECTORY, lenDefaultTempDirPath);
+            memset(tempDirPath + lenDefaultTempDirPath, 0, 1);
+        }
+        char dumpFilePath[MAX_PATH] = {0};
+        snprintf(dumpFilePath, MAX_PATH, "%s\\%s", tempDirPath, MINIDUMP_FILE_NAME);
+        parseAndPrintCustomStreamFromMiniDump(dumpFilePath);
+    } else {
+        for (int i=1; i < argc; ++i) {
+            char *path = argv[i];
+            parseAndPrintCustomStreamFromMiniDump(path);
+        }
+    }
+
+    return 0;
+}
+```
+
+Since `MiniDumpReadDumpStream` comes from the `Dbghelp.h` header, we just make
+sure that we link against `Dbghelp.lib` when building our `.exe`, and that's it:
+
+```text
+set DumpReaderCommonCompilerFlags=/nologo /W4 /WX /Fe:"%BuildDir%\dump_reader.exe"
+set DumpReaderDebugCompilerFlags=%DumpReaderCommonCompilerFlags% /Zi /Od
+set DumpReaderReleaseCompilerFlags=%DumpReaderCommonCompilerFlags% /O2
+
+set DumpReaderCommonLinkerFlags=/nologo /machine:x64 /incremental:no /subsystem:console /defaultlib:Kernel32.lib /defaultlib:Dbghelp.lib /pdb:"%BuildDir%\dump_reader.pdb"
+set DumpReaderDebugLinkerFlags=%DumpReaderCommonLinkerFlags% /opt:noref /debug
+set DumpReaderReleaseLinkerFlags=%DumpReaderCommonLinkerFlags% /opt:ref
+
+set DumpReaderEntryPoint=%~dp0src\maya_read_custom_dump_user_streams_main.c
+
+if "%BuildType%"=="debug" (
+    set DumpReaderBuildCmd=cl %DumpReaderDebugCompilerFlags% "%DumpReaderEntryPoint%" /link %DumpReaderDebugLinkerFlags%
+) else (
+    set DumpReaderBuildCmd=cl %DumpReaderReleaseCompilerFlags% "%DumpReaderEntryPoint%" /link %DumpReaderReleaseLinkerFlags%
+)
+
+echo Compiling custom dump file reader (command follows)...
+echo %DumpReaderBuildCmd%
+%DumpReaderBuildCmd%
+```
+
+Once you compile this, you should be able to get the following output in your
+command prompt:
+
+```text
+dump_reader.exe
+Maya API version: 20200000
+Custom API version: 20200000
+Maya file version: 250
+Y is up: 1
+Last DAG parent: pSphere1
+Last DAG child: pCube1
+Last DAG message: 0
+Last DG node added: pCube1
+End of crash info.
+```
+
+Brilliant! But of course, while this is good enough for running on several dumps
+at once, wouldn't it be nice if we had this same functionality within WinDbg
+itself when we're looking at the dump file as well? How do we give ourselves the
+same functionality there as well?
+
+
+## Writing a WinDbg extension ##
+
+The answer lies in the extensibility that WinDbg provides to us in the form of
+[WinDbg extensions.](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/writing-wdbgexts-extensions)
+These are basically similar to Maya plug-ins, but for WinDbg: they're, again,
+DLLs with fixed exported entry points for being loaded into WinDbg. However,
+unlike Maya plug-ins, there are some convenience macros for declaring the
+equivalent of `MPxCommand`s that allow us to execute arbitrary code from within
+the debugger engine. With writing an extension, we then have the ability to
+write a special debugger command to basically extract the customized user stream
+from our dump file, parse it, and display human-readable information about it.
+
+Great! So let's go ahead and get started. Writing a WinDbg extension, as you
+will soon see, is trivially simple once you understand the documentation.
+
+!!! note Why not write a `DbgEng` extension instead?
+    Those of you who are already familiar with WinDbg might be wondering why
+    I'm electing to write what is known as a `WdbgExts` extension, rather than
+    utilizing the newer [`DbgEng`](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/writing-dbgeng-extension-code)
+    API for writing WinDbg extensions, or the even-newer [JavaScript API](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/javascript-debugger-scripting).
+    The answer is because, quite frankly, we don't need the features of `DbgEng`
+    and the overhead of COM involved for our uses, and JavaScript debugger
+    extensions...well...let's not talk about the overhead there.
+
+All WinDbg extensions start with the entry point, along with some boilerplate
+functions. In a new file called `windbg_custom_ext_main.c`, have the following
+code pasted in there:
+
+```cpp
+#ifndef _WIN32
+#error "Unsupported platform for compilation."
+#endif // _WIN32
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+
+#ifndef DLL_EXPORT
+#define DLL_EXPORT __declspec(dllexport)
+#endif
+
+#define KDEXT_64BIT
+#include <wdbgexts.h>
+
+#include <Dbghelp.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+
+static EXT_API_VERSION gApiVersion = { 1, 0, EXT_API_VERSION_NUMBER64, 0 };
+
+WINDBG_EXTENSION_APIS64 ExtensionApis = {0};
+static USHORT gSavedMajorVersion = 0;
+static USHORT gSavedMinorVersion = 0;
+
+
+DLL_EXPORT BOOL DllMain(HINSTANCE hInstDLL, DWORD dwReason, DWORD dwReserved)
+{
+    (void)hInstDLL;
+    (void)dwReserved;
+    switch (dwReason) {
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+    case DLL_PROCESS_ATTACH:
+    default:
+        break;
+    }
+
+    return TRUE;
+}
+
+
+DLL_EXPORT VOID WinDbgExtensionDllInit(PWINDBG_EXTENSION_APIS64 lpExtApis, USHORT majorVer, USHORT minorVer)
+{
+    ExtensionApis = *lpExtApis;
+    gSavedMajorVersion = majorVer;
+    gSavedMinorVersion = minorVer;
+
+    return;
+}
+
+
+DLL_EXPORT LPEXT_API_VERSION ExtensionApiVersion()
+{
+    return &gApiVersion;
+}
+
+
+DLL_EXPORT VOID CheckVersion()
+{
+    if (gApiVersion.MajorVersion != gSavedMajorVersion) {
+        dprintf("WARNING: The major version of the debugger and extension are mismatched. %d %d\n", gApiVersion.MajorVersion, gSavedMajorVersion);
+    }
+
+    if (gApiVersion.MinorVersion != gSavedMinorVersion) {
+        dprintf("WARNING: The minor version of the debugger and extension are mismatched. %d %d\n", gApiVersion.MinorVersion, gSavedMinorVersion);
+    }
+
+    return;
+}
+```
+
+As far as the includes go, there's really only one point of interest here:
+
+```cpp
+#define KDEXT_64BIT
+```
+
+This may seem like a pretty random macro, but it's actually used by the
+`wdbgext` APIs to switch to 64-bit addresses instead. Additionally, this _has_
+to defined before all your other structure definitions as well in order to
+actually be effective, which is why we place it earlier in the source.
+
+After the usual suspects (includes), we then have basic code defining our WinDbg
+extension version, and some global variables to hold the storage for the actual
+version of WinDbg that we are running. Then...that's a bunch of
+mysterious-looking, though simple functions. Let's go over them in turn and see
+what they do for us:
+
+The first one, `DLLMain`, should be pretty familiar to anyone with any Win32
+programming experience: this is the default entry point called by Windows upon
+loading our DLL (or starts/terminates a thread within the process). While we
+don't need to specify one explicitly, I've gotten into the habit of doing so to
+make it _explicitly_ clear what I intend to happen: nothing, as I've been bitten
+by this a few times now.
+
+The second one, `WinDbgExtensionDllInit`, is also another entry point, but this
+one, like Maya's `initializePlugin`, is WinDbg-specific. It's called by WinDbg
+right when our extension is loaded, and as you can see, all we're doing is just
+setting the stored global variables to that of the current build version (major
+and minor) of the Windows OS that the end-user is running our extension on.
+
+`ExtensionApiVersion` just returns our hard-coded extension version, and is also
+used by the debugger to determine what version of our extension we are
+running. In the same vein, `CheckVersion` is called by the debugger each time
+any time we run any of the commands in our extension (i.e. anything starting
+with a `!` mark, like `!analyze`), which we'll use for just checking against the
+debugger version (though really nothing much untoward should happen with what
+we're planning to do). One thing to note is that you are _required_ to implement
+`ExtensionApiVersion`, while `CheckVersion` is optional.
+
+We can now focus on compiling the plug-in first, before adding our own
+functionality. Thankfully, compiling a WinDbg extension is trivially simple,
+especially since we're writing it in C. These are the relevant lines from my
+`build.bat` build script:
+
+```text
+set WinDbgExtCommonCompilerFlags=/nologo /W4 /WX
+set WinDbgExtDebugCompilerFlags=%WinDbgExtCommonCompilerFlags% /Zi /Od
+set WinDbgExtReleaseCompilerFlags=%WinDbgExtCommonCompilerFlags% /O2
+
+set WinDbgExtCommonLinkerFlags=/nologo /dll /machine:x64 /incremental:no /subsystem:windows /out:"%BuildDir%\windbg_%ProjectName%.dll" /pdb:"%BuildDir%\windbg_%ProjectName%.pdb" /defaultlib:Kernel32.lib /defaultlib:User32.lib
+set WinDbgExtDebugLinkerFlags=%WinDbgExtCommonLinkerFlags% /opt:noref /debug
+set WinDbgExtReleaseLinkerFlags=%WinDbgExtCommonLinkerFlags% /opt:ref
+
+set WinDbgExtEntryPoint=%~dp0src\windbg_custom_ext_main.c
+
+if "%BuildType%"=="debug" (
+    set WinDbgExtBuildCmd=cl %WinDbgExtDebugCompilerFlags% "%WinDbgExtEntryPoint%" /link %WinDbgExtDebugLinkerFlags%
+) else (
+    set WinDbgExtBuildCmd=cl %WinDbgExtReleaseCompilerFlags% "%WinDbgExtEntryPoint%" /link %WinDbgExtReleaseLinkerFlags%
+)
+
+echo Compiling WinDbg extension (command follows)...
+echo %WinDbgExtBuildCmd%
+%WinDbgExtBuildCmd%
+```
+
+Yep, as you can see, it's no different than compiling any other sort of
+DLL. Deploying it is even simpler:
+
+
+```text
+if not "%_NT_DEBUGGER_EXTENSION_PATH%"=="" (
+    echo Copying WinDbg extension to deployment location %_NT_DEBUGGER_EXTENSION_PATH% ...
+    echo .
+    copy /Y "%BuildDir%\windbg_%ProjectName%.dll" "%_NT_DEBUGGER_EXTENSION_PATH%"
+)
+```
+
+The environment variable `__NT_DEBUGGER_EXTENSION_PATH` is known to all the
+Microsoft debuggers (WinDbg Preview/WinDbg/Visual Studio) and all DLL files
+located at the location specified will be automatically available to load
+withiin WinDbg, which is why we copy our built binary there.
+
+## Parsing our dump manually ##
+
+Now that we're here, it's time for the real meat of what our extension should
+do, which is to extract our custom user stream and parse it. However, there's a
+problem: unlike what we did when writing our standalone user stream parser, we
+can't make use of `MiniDumpReadDumpStream` here:
+
+!!! warning Writing WdbgExts Extension Code
+    You must not attempt to call any DbgHelp or ImageHlp routines from a
+    debugger extension. This is not supported and may cause a variety of problems.
+    https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/writing-wdbgexts-extension-code
+
+Whelp. Even though during my personal testing, I could call
+`MiniDumpReadDumpStream` just fine, I wouldn't bet against the MSDN
+documentation here since it's pretty much spelled out in black-and-white. What
+can we do then to get our information instead?
+
+Thanks to an [obscure post on Stack Overflow](https://stackoverflow.com/questions/5487279/how-do-i-extract-a-user-stream-from-a-windbg-extension),
+the answer is, quite simply, to do the work ourselves:
+
+```cpp
+DLL_EXPORT DECLARE_API(readMayaDumpStreams)
+{
+    char tempDirPath[MAX_PATH] = {0};
+    DWORD lenTempDirPath = GetEnvironmentVariable((LPCTSTR)TEMP_ENV_VAR_NAME, (LPTSTR)tempDirPath, (DWORD)MAX_PATH);
+    if (lenTempDirPath == 0) {
+        const size_t lenDefaultTempDirPath = strlen(DEFAULT_TEMP_DIRECTORY);
+        memcpy(tempDirPath, DEFAULT_TEMP_DIRECTORY, lenDefaultTempDirPath);
+        memset(tempDirPath + lenDefaultTempDirPath, 0, 1);
+    }
+    char dumpFilePath[MAX_PATH] = {0};
+    snprintf(dumpFilePath, MAX_PATH, "%s\\%s", tempDirPath, MINIDUMP_FILE_NAME);
+    HANDLE hFile = CreateFile(dumpFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        dprintf("ERROR: Could not open the dump file requested.\n");
+        return;
+    }
+
+    PMINIDUMP_HEADER pDumpHeader = NULL;
+    PMINIDUMP_DIRECTORY pDumpDirPath = NULL;
+    PMINIDUMP_USER_STREAM pDumpUserStream = NULL;
+    static const ULONG gBufSize = 0x1000;
+    void *pBuf = malloc(gBufSize);
+    DWORD bytesRead = 0;
+
+    BOOL bStat = ReadFile(hFile, pBuf, sizeof(MINIDUMP_HEADER), &bytesRead, NULL);
+    if (bStat == 0) {
+        dprintf("ERROR: File read failure.\n");
+        return;
+    }
+
+    ULONG numUserStreams = 0;
+    if (bytesRead == sizeof(MINIDUMP_HEADER)) {
+        pDumpHeader = (PMINIDUMP_HEADER)pBuf;
+        numUserStreams = pDumpHeader->NumberOfStreams;
+        for (ULONG i=0; i < numUserStreams; ++i) {
+            bStat = ReadFile(hFile, pBuf, sizeof(MINIDUMP_DIRECTORY), &bytesRead, NULL);
+            if (bStat == 0) {
+                dprintf("ERROR: Failed to read minidump directory.\n");
+                break;
+            }
+
+            pDumpDirPath = (PMINIDUMP_DIRECTORY)pBuf;
+            if (pDumpDirPath->StreamType != MAYA_CRASH_INFO_STREAM_TYPE) {
+                continue;
+            }
+            pDumpUserStream = (PMINIDUMP_USER_STREAM)pBuf;
+            ULONG streamBufSize = pDumpUserStream->BufferSize;
+            if (streamBufSize != sizeof(MayaCrashDumpInfo)) {
+                dprintf("ERROR: The stream size does not match that of the known crash dump structure.\n");
+                continue;
+            }
+            ULONG streamType = pDumpUserStream->Type;
+            PCHAR pUserStreamBuf = (PCHAR)pDumpUserStream->Buffer;
+            DWORD curPos = SetFilePointer(hFile, 0, NULL, FILE_CURRENT);
+            SetFilePointer(hFile, (LONG)pUserStreamBuf, NULL, FILE_BEGIN);
+            MayaCrashDumpInfo crashInfo = {0};
+            bStat = ReadFile(hFile, &crashInfo, streamBufSize, &bytesRead, NULL);
+            if (bStat == 0 || bytesRead != streamBufSize) {
+                dprintf("ERROR: Failed to read user stream.\n");
+                break;
+            }
+
+            dprintf("\n"
+                    "-------------------------------------------------\n"
+                    "Maya dump file information is as follows:\n"
+                    "Stream type %d:\n"
+                    "Maya API version: %d\n"
+                    "Custom API version: %d\n"
+                    "Maya file version:: %d\n"
+                    "Is Y-axis up: %d \n"
+                    "Last DAG parent: %s \n"
+                    "Last DAG child: %s \n"
+                    "Last DAG message: %d \n"
+                    "Last DG node added: %s \n"
+                    "\nEnd of crash info. \n"
+                    "-------------------------------------------------\n"
+                    "\n\n", streamType, crashInfo.verAPI, crashInfo.verCustom, crashInfo.verMayaFile, crashInfo.isYUp, crashInfo.lastDagParentName, crashInfo.lastDagChildName, crashInfo.lastDagMessage, crashInfo.lastDGNodeAddedName);
+
+            SetFilePointer(hFile, curPos, NULL, FILE_BEGIN);
+        }
+    } else {
+        dprintf("ERROR: Unable to read minidump header.\n");
+    }
+
+    CloseHandle(hFile);
+
+    free(pBuf);
+
+    return;
+}
+```
+
+Ok, that was all very scary, I'm sure. Dealing with raw bytes! Think of the
+children! So let's go over it, line-by-line.
+
+The first part is the declaration of a new command using the `DECLARE_API` macro
+from the WdbgExts API:
+
+```cpp
+DLL_EXPORT DECLARE_API(readMayaDumpStreams)
+```
+
+This will allow us to execute the WinDbg command `!readMayaDumpStreams` which
+will then run our code.
+
+After some initial boilerplate to get the path to our dump file and create a
+file handle to it, we get to this part:
+
+```cpp
+    PMINIDUMP_HEADER pDumpHeader = NULL;
+    PMINIDUMP_DIRECTORY pDumpDirPath = NULL;
+    PMINIDUMP_USER_STREAM pDumpUserStream = NULL;
+```
+
+"Interesting", you might think. "Where on earth would I know about these
+structures had I not read that Stack Overflow post?"
+
+The answer lies in `minidumpapiset.h`, which is strangely not documented very
+well on MSDN. Essentially, we see that the memory layout of a minidump, like any
+other file format, is pretty well-explained just by looking at the structs:
+
+```cpp
+typedef struct _MINIDUMP_HEADER {
+    ULONG32 Signature;
+    ULONG32 Version;
+    ULONG32 NumberOfStreams;
+    RVA StreamDirectoryRva;
+    ULONG32 CheckSum;
+    union {
+        ULONG32 Reserved;
+        ULONG32 TimeDateStamp;
+    };
+    ULONG64 Flags;
+} MINIDUMP_HEADER, *PMINIDUMP_HEADER;
+```
+
+The `StreamDirectoryRva` member is again, a relative virtual address to the
+start of `MINIDUMP_DIRECTORY` structures, which look like the following:
+
+```cpp
+typedef struct _MINIDUMP_DIRECTORY {
+    ULONG32 StreamType;
+    MINIDUMP_LOCATION_DESCRIPTOR Location;
+} MINIDUMP_DIRECTORY, *PMINIDUMP_DIRECTORY;
+```
+
+Look familiar? Turns out that `StreamType` member _is_ the user stream type! And
+in there, the `Location` member struct looks like this:
+
+```cpp
+typedef struct _MINIDUMP_LOCATION_DESCRIPTOR64 {
+    ULONG64 DataSize;
+    RVA64 Rva;
+} MINIDUMP_LOCATION_DESCRIPTOR64;
+```
+
+...Which basically points to the location of our custom user stream data that
+we're interested in (again, as a relative virtual address), along with its
+stored size (but we know that already, since we packed the struct ourselves)
+
+Thus! We have all the information we need to get to our user stream. Well,
+almost:
+
+```cpp
+    static const ULONG gBufSize = 0x1000;
+    void *pBuf = malloc(gBufSize);
+    DWORD bytesRead = 0;
+
+    BOOL bStat = ReadFile(hFile, pBuf, sizeof(MINIDUMP_HEADER), &bytesRead, NULL);
+    if (bStat == 0) {
+        dprintf("ERROR: File read failure.\n");
+        return;
+    }
+```
+
+Where is the magic number `0x1000` coming from? Well, apparently, that's the
+[size of the minidump header, even though the struct would have you believe otherwise.](https://computer.forensikblog.de/en/2006/03/dmp-file-structure.html)
+4096 bytes. The size of a single memory page on x64 Windows. Who would have guessed?
+
+Continuing on, we read the file header into a buffer, and start to parse the
+header itself:
+
+```cpp
+    ULONG numUserStreams = 0;
+    if (bytesRead == sizeof(MINIDUMP_HEADER)) {
+        pDumpHeader = (PMINIDUMP_HEADER)pBuf;
+        numUserStreams = pDumpHeader->NumberOfStreams;
+        for (ULONG i=0; i < numUserStreams; ++i) {
+            bStat = ReadFile(hFile, pBuf, sizeof(MINIDUMP_DIRECTORY), &bytesRead, NULL);
+            if (bStat == 0) {
+                dprintf("ERROR: Failed to read minidump directory.\n");
+                break;
+
+            pDumpDirPath = (PMINIDUMP_DIRECTORY)pBuf;
+            if (pDumpDirPath->StreamType != MAYA_CRASH_INFO_STREAM_TYPE) {
+                continue;
+            }
+            pDumpUserStream = (PMINIDUMP_USER_STREAM)pBuf;
+            ULONG streamBufSize = pDumpUserStream->BufferSize;
+            if (streamBufSize != sizeof(MayaCrashDumpInfo)) {
+                dprintf("ERROR: The stream size does not match that of the known crash dump structure.\n");
+                continue;
+            }
+            ULONG streamType = pDumpUserStream->Type;
+            PCHAR pUserStreamBuf = (PCHAR)pDumpUserStream->Buffer;
+            DWORD curPos = SetFilePointer(hFile, 0, NULL, FILE_CURRENT);
+            SetFilePointer(hFile, (LONG)pUserStreamBuf, NULL, FILE_BEGIN);
+            MayaCrashDumpInfo crashInfo = {0};
+            bStat = ReadFile(hFile, &crashInfo, streamBufSize, &bytesRead, NULL);
+            if (bStat == 0 || bytesRead != streamBufSize) {
+                dprintf("ERROR: Failed to read user stream.\n");
+                break;
+            }
+
+            dprintf("\n"
+                    "-------------------------------------------------\n"
+                    "Maya dump file information is as follows:\n"
+                    "Stream type %d:\n"
+                    "Maya API version: %d\n"
+                    "Custom API version: %d\n"
+                    "Maya file version:: %d\n"
+                    "Is Y-axis up: %d \n"
+                    "Last DAG parent: %s \n"
+                    "Last DAG child: %s \n"
+                    "Last DAG message: %d \n"
+                    "Last DG node added: %s \n"
+                    "\nEnd of crash info. \n"
+                    "-------------------------------------------------\n"
+                    "\n\n", streamType, crashInfo.verAPI, crashInfo.verCustom, crashInfo.verMayaFile, crashInfo.isYUp, crashInfo.lastDagParentName, crashInfo.lastDagChildName, crashInfo.lastDagMessage, crashInfo.lastDGNodeAddedName);
+
+            SetFilePointer(hFile, curPos, NULL, FILE_BEGIN);
+```
+As you can see, with those structures now available for us to see, this code
+becomes less mysterious:
+
+1. We're merely just inspecting the header, finding the number of user streams
+    within the dump.
+
+2. We then proceed to walking each stream in turn (i.e. `MINIDUMP_DIRECTORY`),
+   checking the stream type to see if it's the one we're interested in (i.e.
+   our custom stream type `MAYA_CRASH_INFO_STREAM_TYPE`).
+
+3. We then cast that to our custom stream memory layout and again read the bytes
+   into another buffer.
+
+4. Finally, we print the information from the bytes to human-readable format
+   using `dprintf`, which is a WdbgExts API function for printing to the output
+   view of the WinDbg application.
+
+If you compile this DLL now and load it in WinDbg (using the `.load` command)
+and then fire the command `!readMayaDumpStreams`, you should get the exact same
+output that we had in the previous chapter.
+
+With that, congratulations! You've accomplished quite a feat here: not only have
+you overriden the Autodesk crash handler in Maya, a tactic you could apply to
+almost any application, you've also learned a little more about how error
+handling and crashes are handled on Win32, and how to write some tooling to help
+yourself and others debug those crashes via either your own standalone tools, or
+integrating them into WinDbg. I hope this has been a useful and interesting
+lesson.
+
+# Epilogue: potential problems #
+
+Now, let's discuss some potential cons of the approaches discussed in this
+tutorial, and some solutions for those.
+
+## Runtime overhead and performance ##
+
+Well, the most obvious one has been staring at us in the face all this
+while. For this plug-in to work effectively in production, we'd essentially have
+to register a ton of additional callbacks within Maya, which adds a runtime
+cost. We also have to consider, depending on what we're storing into memory
+(i.e. perhaps storing the _entire scene_, or parts of it, so that we can
+reconstruct it from the dump file), how much overhead we're going to be adding
+there as well.
+
+However, in my opinion, this is a reasonable cost when weighed against the value
+of the data you'd be getting. The way I see this working is that when you have
+a problem that is occuring on an end-user's machine that defies all explanation
+and occurs without reproducibility, you deploy this plug-in to them and get more
+information while they take a minor hit in performance. The amount of data
+captured could also be tweaked with plug-in options in order to mitigate against
+performance as well. Ultimately, this is a solveable problem with some careful
+pipelining work.
+
+## Safety and Guarantees? Don't count on it ##
+
+Another thing that we should be aware of here is that this solution is _by no
+means 100% bulletproof_. Just because the example code here places the data in
+the `.bss` section doesn't mean that it's going to be safe from buffer overruns,
+or other types of memory corruption issues. There's a bunch of ways around this
+issue, depending on how far you're willing to take it:
+
+1. Periodically flush the buffers to other parts of reserved process
+   memory and set the page protections appropriately. This will allow for a (more)
+   permanant record of what you've done and you can just read from them when
+   writing the dump to disk instead.
+
+2. Continuously write to the minidump file handle, either manually or by
+   re-writing the _entire dump_ each time a callback is executed, which would be
+   _incredibly expensive_, but at least guarantee a more timely update of
+   information before your crash occurs.
+
+All options really depend on your scenario and what kind of crashes you are
+expecting to occur within your pipeline. Adjust accordingly.
+
+Another issue, on a more humanistic side, is that we don't necessarily guarantee
+that the information we capture will be helpful in diagnosing the _actual_ root
+cause. However, on this point, I like to think of debugging as a case within a
+Sherlock Holmes story: all the data we're getting here is just that, data. As
+long as we use this data to help us in making theories about root causes suit
+_them_, rather than the other way round, it's better than the normal information
+you get from a minidump.
+
+Finally, we don't guarantee that _all_ types of exceptions will be caught by
+this, even if you go ahead and implement all the VS intrinsics, the CRT signal
+handlers, etc. There are some types of exceptions that are just _really_ hard to catch, as
+[this article explains](https://peteronprogramming.wordpress.com/2016/05/29/crashes-you-cant-handle-easily-1-seh-failure-on-x64-windows/).
+If you find yourself wanting of a solution to tackle one of the issues he brings
+up in the series of articles, I encourage you to read the WER solution offered
+there and see if works for you.
+
+
+# Closing thoughts #
+
+Well, if you've stuck around till this point, perhaps this has given you an
+insight into how exceptions are handled on Windows in the modern x64 era. Even
+if you don't necessarily implement this the exact same way, hopefully you'll
+have learned a thing or two along the way to help yourself make it easier to
+debug your own applications in the future. The tools for debugging user-mode
+crashes have never been more powerful than in our current generation of hardware
+and software, and I am of the firm belief that there is little excuse these days
+to plead ignorance when it comes to identifying root causes.
+
+Fixing them, on the other hand...
+
+
+# Credits #
+
+The work I've done here would not be possible (or at the least, would have been
+incredibly difficult) without the prior work of some amazing authors:
+
+* [Cristian Adam](https://www.codeproject.com/Articles/154686/SetUnhandledExceptionFilter-and-the-C-C-Runtime-Li)'s
+  article on his original implementation of this approach.
+
+* [Jérémie Laval](https://blog.neteril.org/blog/2016/12/23/diverting-functions-windows-iat-patching/),
+  for more information on how the Import Address Table works on Win32 and
+  providing valuble sample code for reference.
+
+* [peteronprogramming](https://peteronprogramming.wordpress.com/2016/05/29/crashes-you-cant-handle-easily-1-seh-failure-on-x64-windows/),
+  for his series of articles regarding the shortfalls of various approaches on
+  Windows to dealing with this problem.
+
+* [Morgan Mcguire](https://casual-effects.com/markdeep/), for the Markdeep
+  format used to write this article.
+
+* [Windows via C/C++, Fifth Edition](https://www.amazon.com/Windows-via-softcover-Developer-Reference/dp/0735663777)
+  by Jeffrey Richter and Christophe Nasarre, whose code and explanation in
+  Chapter 22: DLL Injection and API Hooking was invaluable as a reference when
+  writing this implementation.
+
+* Aras Pranckevicius, for writing the original Markdeep theme used in this tutorial.
+
+
+# Legal disclaimer & License #
+
+All work done here is of a personal nature and opinions expressed here are
+purely my own and do not reflect any of my current/previous employers. No code
+demonstrated here is indicative of my _actual_ professional work (which usually
+tends to be a lot more boring and mundane in the first place), and should not be
+viewed as representative of the companies I work/worked for/with, nor an
+endorsement of any coding practices or otherwise in an official capacity.
+
+The license for this tutorial is available in the code repository that
+accompanies this, in the file named `LICENSE`, which also governs the code
+samples provided, except where otherwise noted.
+
+<style class="fallback">body{visibility:hidden}</style><script>markdeepOptions={tocStyle:'medium'};</script>
+<!-- Markdeep: --><script src="https://casual-effects.com/markdeep/latest/markdeep.min.js?" charset="utf-8"></script>
