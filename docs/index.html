@@ -2,9 +2,6 @@
 
 **Writing a custom Unhandled Exception Filter for Maya**
 
-(...or for anything, really. But hey, what good is a tutorial these days without
-a click-bait-y title of sorts?)
-
 # Introduction #
 
 Hello (again, if you've read any of my previous tutorials).
@@ -18,11 +15,18 @@ over some scenarios where a simple unhandled exception filter isn't enough to
 intercept some types of crashes, and discuss possible strategies to accomodate
 those situations.
 
+!!! note Just Maya? I'm outta here...
+    Even though this tutorial is going to be targeted towards writing the filter
+    for Maya, the information here could really be applied to any application
+    executable, and so if you're interested in something like installing your
+    own crash handler in Blender, or Houdini, or even your own game engine,
+    you might still find this of interest!
+
 
 # Code repository #
 
 All the source code for this tutorial is available
-[here](https://github.com/sonictk/maya_custom_unhandled_exception_filter).
+[here](https://github.com/sonictk/maya_custom_unhandled_exception_filter_tutorial).
 
 Perfunctory disclaimer: the code is written in a very tutorial-focused,
 non-production manner. This means that there is very little
@@ -31,8 +35,14 @@ other options that might be more performant and/or scalable. The code is
 available as a reference, and should not be taken as an indicator of what good
 robust code shipped to end-users should look like.
 
+If you are going to use the example code provided in production directly, do so
+at your own risk.
+
 
 # Why are we doing this? #
+
+Ok, so let's talk a little bit about the current state of crash handling in
+general when it comes to our day-to-day work in Maya.
 
 The default Autodesk Maya crash handler is pretty dismal, all things
 considered. It's essentially there to write out a minidump to disk, attempt to
@@ -44,11 +54,13 @@ since at least you can [easily customize what WER does in the event of a
 crash](https://docs.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps).)
 
 I've also never had a case in my professional experience where Autodesk actually
-took advantage of it to identify our issues; in every single case where a dump
-was involved in triaging and identifying a root cause, I was the one providing
-the dump and initial analysis for our representative to forward to the
-engineering teams instead. For this reason, among others, I don't feel too bad
-about ignoring the existing machinery surrounding the capture of crashes.
+took advantage of their own crash handler to identify our issues; in every
+single case where a dump was involved in triaging and identifying a root cause,
+I was the one providing a reproducible case, or the dump and initial analysis
+for our designated representative to forward to the engineering teams
+instead. For this reason, among others (which I can't publicly go into here), I
+don't feel too bad about ignoring the existing machinery surrounding the capture
+of crashes.
 
 For obvious reasons, this tutorial will only focus on Windows. Linux and macOS
 have different facilities for handling exceptions and abnormal process
@@ -64,45 +76,6 @@ a cross-platform environment, it will appear in the following manner:
 
 Let's go over what you'll be required to have with you before following along in
 this tutorial.
-
-
-## What you will need ##
-
-- Windows 10 and _a_ version of Autodesk Maya. This tutorial was
-  written against Maya 2020, but theoretically should work with any version of
-  Maya, as you'll see why later on.
-
-- A **C/C++ development environment** set up and ready to go. (If you want to see
-  what my Emacs setup looks like, it's
-  available [here](https://github.com/sonictk/lightweight-emacs).)
-
-- Visual Studio (For the compiler).
-
-!!! warning MSVC Compiler versions
-    You should use the recommended MSVC compiler that Maya was built against.
-    Information on this is available in the SDK documentation and also on
-    Cyrille Fauvel's blog: https://around-the-corner.typepad.com/adn/2019/12/maya-2020-api-update-guide.html
-
-- The Maya Devkit for your particular Maya version. These are (currently)
-  available at:
-  https://www.autodesk.com/developer-network/platform-technologies/maya
-
-- [WinDbg](https://www.microsoft.com/en-us/p/windbg-preview/9pgjgd53tn86?activetab=pivot:overviewtab).
-  I recommend getting WinDbg Preview, but if you detest the Microsoft Store as
-  much as I do and insist on having local, non-DRM binaries, you can use the
-  [legacy version](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-download-tools) as well.
-
-- A good disassembler if you want to follow along in some of the theory sections
-  of this tutorial. I make use of
-  both [IDA](https://www.hex-rays.com/products/ida/support/download_freeware/)
-  or [radare2/Cutter](https://rada.re/n/), but you're welcome to use any
-  disassembler you'd like, as long as it has x86/x64 architecture support. If
-  you don't have knowledge of x64 assembly, don't worry; I have [the tutorial
-  just for that](https://sonictk.github.io/asm_tutorial/). No guru knowledge
-  required here, just a basic working knowledge of assembly will do.
-
-If you're experienced with writing Maya plug-ins, you probably would have these
-already anyway, so as you can see, it's not that difficult.
 
 
 ## What you should know ##
@@ -127,8 +100,48 @@ already anyway, so as you can see, it's not that difficult.
   work, nor how the callback system works either. You are expected to read up on
   these subjects on your own if you are unfamiliar with the material covered.
 
-Don't worry about knowing Win32 specifics, I'll go over what you need to know
-as we go along. Let's begin!
+
+## What you will need ##
+
+- Windows 10 and _a_ version of Autodesk Maya. This tutorial was
+  written against Maya 2020, but theoretically should work with any version of
+  Maya, as you'll see why later on.
+
+- A **C/C++ development environment** set up and ready to go. (If you want to see
+  what my Emacs setup looks like, it's
+  available [here](https://github.com/sonictk/lightweight-emacs).)
+
+- Visual Studio (For the compiler).
+
+!!! warning MSVC Compiler versions
+    You should use the recommended MSVC compiler that Maya was built against.
+    Information on this is available in the SDK documentation and also on
+    Cyrille Fauvel's blog: https://around-the-corner.typepad.com/adn/2019/12/maya-2020-api-update-guide.html
+
+- The Maya Devkit for your particular Maya version. These are (currently)
+  available at:
+  https://www.autodesk.com/developer-network/platform-technologies/maya
+  Again, if you're familiar with building Maya plug-ins, you'd probably already
+  have this lying around somewhere.
+
+- [WinDbg](https://www.microsoft.com/en-us/p/windbg-preview/9pgjgd53tn86?activetab=pivot:overviewtab).
+  I recommend getting WinDbg Preview, but if you detest the Microsoft Store as
+  much as I do and insist on having local, non-DRM binaries, you can use the
+  [legacy version](https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-download-tools) as well.
+
+- A good disassembler if you want to follow along in some of the theory sections
+  of this tutorial. I make use of
+  both [IDA](https://www.hex-rays.com/products/ida/support/download_freeware/)
+  or [radare2/Cutter](https://rada.re/n/), but you're welcome to use any
+  disassembler you'd like, as long as it has x86/x64 architecture support. If
+  you don't have knowledge of x64 assembly, don't worry; I have [the tutorial
+  just for that](https://sonictk.github.io/asm_tutorial/). No guru knowledge
+  required here, just a basic working knowledge of assembly will do.
+
+If you're experienced with writing Maya plug-ins, you probably would have these
+already anyway, so there's not really that much extra prep you need to do.
+Don't worry about knowing Win32 specifics, I'll go over what you need to know as
+we go along. Let's begin!
 
 
 # Exceptions, how do they even work, like #
@@ -159,8 +172,9 @@ cannot allocate memory, or the OS itself detecting when an invalid parameter is
 passed to a function (or the application itself simply calling
 `RaiseException`). A hardware exception, on the other hand, can be triggered by
 things such as a divide-by-zero operation, or a floating point overflow, or even
-the most common type of exception: an access violation (i.e. reading/writing to
-inaccessible memory).
+the most common type of exception that I'm sure most of us by now are innately
+familiar with: an access violation (i.e. reading/writing to inaccessible
+memory).
 
 The Structured Exception Handling (SEH) mechanism has been around in Windows
 forever (since at least Windows '95), and though its form has changed over the
@@ -553,8 +567,8 @@ mind. The crashes that we'll tackle here are:
 
 6. Calling `std::abort` directly
 
-I'll leave you to guess after looking at the code which ones we can deal with
-successfully, and which can't.
+We're going to implement all of this behaviour shortly, but before that, let's
+talk a little bit more about exceptions and how they work with debuggers.
 
 
 ## First/second-chance exceptions ##
@@ -3474,11 +3488,10 @@ header itself:
 
             SetFilePointer(hFile, curPos, NULL, FILE_BEGIN);
 ```
-As you can see, with those structures now available for us to see, this code
-becomes less mysterious:
+As you can see, with those structures now in the back of our minds, this code
+becomes less mysterious in what it's doing. It boils down essentially to:
 
-1. We're merely just inspecting the header, finding the number of user streams
-    within the dump.
+1. Inspecting the header, finding the number of user streams within the dump.
 
 2. We then proceed to walking each stream in turn (i.e. `MINIDUMP_DIRECTORY`),
    checking the stream type to see if it's the one we're interested in (i.e.
@@ -3501,7 +3514,8 @@ almost any application, you've also learned a little more about how error
 handling and crashes are handled on Win32, and how to write some tooling to help
 yourself and others debug those crashes via either your own standalone tools, or
 integrating them into WinDbg. I hope this has been a useful and interesting
-lesson.
+journey.
+
 
 # Epilogue: potential problems #
 
@@ -3527,7 +3541,7 @@ captured could also be tweaked with plug-in options in order to mitigate against
 performance as well. Ultimately, this is a solveable problem with some careful
 pipelining work.
 
-## Safety and Guarantees? Don't count on it ##
+## Safety and guarantees? Don't count on it ##
 
 Another thing that we should be aware of here is that this solution is _by no
 means 100% bulletproof_. Just because the example code here places the data in
@@ -3556,6 +3570,15 @@ long as we use this data to help us in making theories about root causes suit
 _them_, rather than the other way round, it's better than the normal information
 you get from a minidump.
 
+Yet another problem is that the method of storing the information to be written
+to the dump outlined here assumes thread-safe writes; there are no
+synchronization primitives being used here to guarantee that multiple threads
+don't attempt to update the same memory location. You can certainly throw in a
+couple of mutexes (or more likely,
+[critical section objects](https://docs.microsoft.com/en-us/windows/win32/sync/critical-section-objects))
+here and there to try and safeguard access, but that would likely come with its
+own share of problems and further compound the performance issues.
+
 Finally, we don't guarantee that _all_ types of exceptions will be caught by
 this, even if you go ahead and implement all the VS intrinsics, the CRT signal
 handlers, etc. There are some types of exceptions that are just _really_ hard to catch, as
@@ -3576,7 +3599,7 @@ crashes have never been more powerful than in our current generation of hardware
 and software, and I am of the firm belief that there is little excuse these days
 to plead ignorance when it comes to identifying root causes.
 
-Fixing them, on the other hand...
+Fixing them, on the other hand...that'll have to be a tale (or two) for another time.
 
 
 # Credits #
